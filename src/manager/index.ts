@@ -1,0 +1,1 @@
+export { registerManagerRoutes } from './routes';

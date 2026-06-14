@@ -1,0 +1,38 @@
+{
+  "name": "gateway",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "node dev.js",
+    "build": "node build.js",
+    "start": "node dist/index.js",
+    "test:sdk:responses": "node scripts/test-openai-responses-sdk.mjs",
+    "test": "vitest",
+    "test:coverage": "vitest --coverage"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "description": "",
+  "ts-node": {
+    "compilerOptions": {
+      "module": "CommonJS"
+    }
+  },
+  "dependencies": {
+    "diff": "^8.0.3",
+    "fastify": "^5.8.2",
+    "glob": "^13.0.6",
+    "openai": "^6.27.0",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/glob": "^8.1.0",
+    "@types/node": "^25.3.5",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.27.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}

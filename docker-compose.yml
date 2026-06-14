@@ -1,0 +1,57 @@
+services:
+  toolhub:
+    container_name: next-ai-toolhub
+    build:
+      context: ../toolhub
+      dockerfile: Dockerfile
+    image: next-ai-toolhub:latest
+    working_dir: /app
+    ports:
+      - "3101:3100"
+    environment:
+      NODE_ENV: development
+      HOST: 0.0.0.0
+      PORT: 3100
+      TOOLHUB_CONFIG_PATH: /app/toolhub.config.compose.json
+      TOOLHUB_MANAGEMENT_AUTH_ENABLED: ${TOOLHUB_MANAGEMENT_AUTH_ENABLED:-true}
+      TOOLHUB_MANAGEMENT_TOKEN: ${TOOLHUB_MANAGEMENT_TOKEN:-change-me-toolhub-admin-token}
+      TOOLHUB_MANAGEMENT_HEADER_NAME: ${TOOLHUB_MANAGEMENT_HEADER_NAME:-x-toolhub-admin-key}
+      CXXFLAGS: ${TOOLHUB_CXXFLAGS:--std=gnu++20}
+      npm_config_cxxflags: ${TOOLHUB_CXXFLAGS:--std=gnu++20}
+      npm_config_cppstd: ${TOOLHUB_CPPSTD:-20}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-change-me-anthropic-api-key}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://open.bigmodel.cn/api/anthropic}
+      CODE_TOOL_SEARCH_MODEL: ${CODE_TOOL_SEARCH_MODEL:-glm-5-turbo}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-glm-5-turbo}
+    volumes:
+      - ../:/workspace
+      - ./toolhub.config.compose.json:/app/toolhub.config.compose.json
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  gateway:
+    container_name: next-ai-gateway
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      MCP_REMOTE_KEY: ${MCP_REMOTE_KEY:-change-me-mcp-remote-key}
+    command: npm run dev
+    depends_on:
+      toolhub:
+        condition: service_healthy
+    volumes:
+      - ./:/app
+      - gateway_node_modules:/app/node_modules
+      - ./gateway.config.compose.json:/app/gateway.config.json:ro
+    restart: unless-stopped
+
+volumes:
+  gateway_node_modules:

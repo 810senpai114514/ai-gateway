@@ -1,0 +1,49 @@
+{
+  "host": "0.0.0.0",
+  "port": 3100,
+  "toolExposureMode": "code-tool",
+  "mcpServers": [
+    {
+      "name": "minimax",
+      "transport": "stdio",
+      "protocolVersion": "2024-11-05",
+      "startupTimeoutMs": 100000,
+      "requestTimeoutMs": 100000,
+      "stdioMessageMode": "newline-json",
+      "command": "uvx",
+      "args": [
+        "minimax-coding-plan-mcp"
+      ],
+      "env": {
+        "MINIMAX_API_KEY": "replace-with-minimax-api-key",
+        "MINIMAX_API_HOST": "https://api.minimaxi.com"
+      }
+    }
+  ],
+  "mcpGateway": {
+    "enabled": true,
+    "endpoint": "/mcp",
+    "websocket": {
+      "enabled": true,
+      "endpoint": "/mcp/ws",
+      "auth": {
+        "allowQueryToken": false,
+        "queryTokenParam": "token"
+      }
+    },
+    "principals": [
+      {
+        "key": "change-me-mcp-remote-key",
+        "team": "edge-gateway",
+        "allowServers": [
+          "*"
+        ],
+        "allowTools": [
+          "*"
+        ],
+        "denyTools": []
+      }
+    ],
+    "serverExposure": {}
+  }
+}
