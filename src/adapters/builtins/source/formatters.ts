@@ -12,10 +12,15 @@ export function formatOpenAIChatCompletionsResponse(response: StandardResponse):
     total_tokens: response.usage.total_tokens
   };
 
-  if (response.usage.cache_read_tokens !== undefined) {
-    usage.prompt_tokens_details = {
-      cached_tokens: response.usage.cache_read_tokens
-    };
+  if (response.usage.cache_read_tokens !== undefined || response.usage.cache_write_tokens !== undefined) {
+    const promptTokenDetails: Record<string, unknown> = {};
+    if (response.usage.cache_read_tokens !== undefined) {
+      promptTokenDetails.cached_tokens = response.usage.cache_read_tokens;
+    }
+    if (response.usage.cache_write_tokens !== undefined) {
+      promptTokenDetails.cache_creation_tokens = response.usage.cache_write_tokens;
+    }
+    usage.prompt_tokens_details = promptTokenDetails;
   }
 
   const toolCalls = collectOpenAIChatToolCalls(response);

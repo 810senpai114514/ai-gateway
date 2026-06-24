@@ -125,6 +125,9 @@ interface ProviderJsonConfig {
   baseurl?: unknown;
   baseUrl?: unknown;
   models?: unknown;
+  openaiChatToolsFormat?: unknown;
+  chatToolsFormat?: unknown;
+  toolsFormat?: unknown;
   extraHeaders?: unknown;
   extraBody?: unknown;
   billing?: unknown;
@@ -424,6 +427,16 @@ interface GatewayAuthIntrospectionJsonConfig {
   responseMap?: unknown;
 }
 
+interface GatewayAuthStaticApiKeysJsonConfig {
+  keys?: unknown;
+  keyEnv?: unknown;
+  keysEnv?: unknown;
+  keyHeader?: unknown;
+  tokenHeader?: unknown;
+  keyBearerOnly?: unknown;
+  tokenBearerOnly?: unknown;
+}
+
 interface GatewayAuthJsonConfig {
   enabled?: unknown;
   mode?: unknown;
@@ -432,6 +445,8 @@ interface GatewayAuthJsonConfig {
   identityHeaders?: unknown;
   signature?: unknown;
   introspection?: unknown;
+  staticApiKeys?: unknown;
+  staticApiKey?: unknown;
 }
 
 interface AgentMcpServerJsonConfig {
@@ -1878,6 +1893,11 @@ function parseGatewayAuthConfig(value: unknown): GatewayAuthConfig {
   const introspectionRaw = isPlainObject(auth?.introspection)
     ? (auth?.introspection as GatewayAuthIntrospectionJsonConfig)
     : undefined;
+  const staticApiKeysRaw = isPlainObject(auth?.staticApiKeys)
+    ? (auth?.staticApiKeys as GatewayAuthStaticApiKeysJsonConfig)
+    : isPlainObject(auth?.staticApiKey)
+      ? (auth?.staticApiKey as GatewayAuthStaticApiKeysJsonConfig)
+      : undefined;
   const introspectionResponseMapRaw = isPlainObject(introspectionRaw?.responseMap)
     ? (introspectionRaw?.responseMap as GatewayAuthIntrospectionResponseMapJsonConfig)
     : undefined;
@@ -1998,7 +2018,8 @@ function parseGatewayAuthConfig(value: unknown): GatewayAuthConfig {
           readString(introspectionResponseMapRaw?.apiKeyId) ||
           'apiKeyId'
       }
-    }
+    },
+    staticApiKeys: parseGatewayAuthStaticApiKeysConfig(staticApiKeysRaw)
   };
 }
 
@@ -2020,7 +2041,50 @@ function parseGatewayAuthMode(value: string | undefined, fallback: GatewayAuthCo
     return 'http_introspection';
   }
 
+  if (
+    normalized === 'static_api_key' ||
+    normalized === 'static-api-key' ||
+    normalized === 'static_api_keys' ||
+    normalized === 'static-api-keys' ||
+    normalized === 'static' ||
+    normalized === 'api_key' ||
+    normalized === 'api-key'
+  ) {
+    return 'static_api_key';
+  }
+
   return fallback;
+}
+
+function parseGatewayAuthStaticApiKeysConfig(
+  raw: GatewayAuthStaticApiKeysJsonConfig | undefined
+): GatewayAuthConfig['staticApiKeys'] {
+  const keyEnv =
+    readString(process.env.AUTH_STATIC_API_KEY_ENV) ||
+    readString(process.env.AUTH_STATIC_API_KEYS_ENV) ||
+    readString(raw?.keyEnv) ||
+    readString(raw?.keysEnv);
+  const keysFromDirectEnv = parseModelList(
+    process.env.AUTH_STATIC_API_KEYS ?? process.env.AUTH_STATIC_API_KEY
+  );
+  const keysFromReferencedEnv = keyEnv ? parseModelList(process.env[keyEnv]) : [];
+  const keysFromConfig = parseModelList(raw?.keys);
+
+  return {
+    keys: dedupeStrings([...keysFromDirectEnv, ...keysFromReferencedEnv, ...keysFromConfig]),
+    keyEnv,
+    keyHeader: normalizeHeaderName(
+      readString(process.env.AUTH_STATIC_API_KEY_HEADER) ||
+        readString(raw?.keyHeader) ||
+        readString(raw?.tokenHeader),
+      'authorization'
+    ),
+    keyBearerOnly: resolveBoolean(
+      process.env.AUTH_STATIC_API_KEY_BEARER_ONLY,
+      raw?.keyBearerOnly ?? raw?.tokenBearerOnly,
+      true
+    )
+  };
 }
 
 function parseBillingQueueConfig(value: unknown): BillingQueueConfig {
@@ -3118,6 +3182,11 @@ function parseProvidersConfig(value: unknown): ProviderConfig[] {
       apiKeyEnv: apiKeyEnvName,
       baseurl: normalizeBaseUrl(readString(item.baseurl) || readString(item.baseUrl)),
       models,
+      openaiChatToolsFormat: parseOpenAIChatToolsFormatToken(
+        readString(item.openaiChatToolsFormat) ||
+          readString(item.chatToolsFormat) ||
+          readString(item.toolsFormat)
+      ),
       extraHeaders: parseModelScopedHeaders(item.extraHeaders, models),
       extraBody: parseModelScopedBody(item.extraBody, models),
       billing: parseModelScopedBilling(item.billing, models),
@@ -3332,6 +3401,7 @@ function parseVirtualModelExecutionConfig(
   const raw = isPlainObject(value) ? (value as Record<string, unknown>) : {};
   const modeRaw = readString(raw.mode)?.toLowerCase();
   const policyRaw = readString(raw.clientToolsPolicy)?.toLowerCase();
+  const streamModeRaw = readString(raw.streamMode ?? raw.stream_mode)?.toLowerCase();
 
   return {
     mode: modeRaw === 'decorate_only' ? 'decorate_only' : 'tool_loop',
@@ -3341,7 +3411,7 @@ function parseVirtualModelExecutionConfig(
     matchMultimodal: readBoolean(raw.matchMultimodal ?? raw.match_multimodal) ?? false,
     matchWebSearch:
       readBoolean(raw.matchWebSearch ?? raw.match_web_search ?? raw.matchWebsearch) ?? false,
-    streamMode: 'buffered'
+    streamMode: streamModeRaw === 'optimistic' ? 'optimistic' : 'buffered'
   };
 }
 
@@ -3593,6 +3663,28 @@ function parseProviderTypeToken(value: string | undefined): ProviderType | undef
     normalized === 'google'
   ) {
     return 'gemini_generate_content';
+  }
+
+  return undefined;
+}
+
+function parseOpenAIChatToolsFormatToken(value: string | undefined): ProviderConfig['openaiChatToolsFormat'] {
+  const normalized = value?.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (!normalized) {
+    return undefined;
+  }
+
+  if (normalized === 'openai' || normalized === 'openai_function' || normalized === 'openai_functions') {
+    return 'openai';
+  }
+
+  if (
+    normalized === 'anthropic' ||
+    normalized === 'anthropic_tool' ||
+    normalized === 'anthropic_tools' ||
+    normalized === 'input_schema'
+  ) {
+    return 'anthropic';
   }
 
   return undefined;

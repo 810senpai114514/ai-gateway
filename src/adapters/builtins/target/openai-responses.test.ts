@@ -545,4 +545,237 @@ describe('openAIResponsesTargetAdapter', () => {
       }
     });
   });
+
+  it('does not add web search tools when the client did not declare one', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.4',
+      input: 'What happened today?'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body).not.toHaveProperty('tools');
+  });
+
+  it('passes explicit OpenAI Responses web_search tools through as hosted tools', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.4',
+      input: 'What happened today?',
+      tools: [
+        {
+          type: 'web_search',
+          search_context_size: 'low',
+          filters: {
+            allowed_domains: ['openai.com']
+          }
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.tools).toEqual([
+      {
+        type: 'web_search',
+        search_context_size: 'low',
+        filters: {
+          allowed_domains: ['openai.com']
+        }
+      }
+    ]);
+  });
+
+  it('maps explicit Anthropic web_search server tools to OpenAI Responses web_search', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 256,
+      tools: [
+        {
+          type: 'web_search_20250305',
+          name: 'web_search',
+          allowed_domains: ['docs.anthropic.com'],
+          blocked_domains: ['example.com']
+        }
+      ],
+      messages: [{ role: 'user', content: 'Search the docs' }]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.tools).toEqual([
+      {
+        type: 'web_search',
+        filters: {
+          allowed_domains: ['docs.anthropic.com'],
+          blocked_domains: ['example.com']
+        }
+      }
+    ]);
+  });
+
+  it('does not expose hosted web_search as an OpenAI chat/completions function tool', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 256,
+      tools: [
+        {
+          type: 'web_search_20250305',
+          name: 'web_search'
+        }
+      ],
+      messages: [{ role: 'user', content: 'Search the docs' }]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body).not.toHaveProperty('tools');
+  });
+
+  it('can emit Anthropic-style tools for OpenAI chat/completions compatibility providers', () => {
+    const parsed = parseAnthropicMessagesRequest({
+      model: 'glm-5.1',
+      max_tokens: 256,
+      tools: [
+        {
+          name: 'web_search',
+          input_schema: {
+            type: 'object',
+            properties: {
+              prompt: {
+                type: 'string'
+              }
+            },
+            required: ['prompt']
+          },
+          description: 'Search the web.'
+        }
+      ],
+      messages: [{ role: 'user', content: 'Search the docs' }]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = openAIResponsesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        openaiApiKey: 'sk-test',
+        openaiBaseUrl: 'https://mock.local/v1'
+      } as never,
+      targetProviderConfig: {
+        type: 'openai_chat_completions',
+        openaiChatToolsFormat: 'anthropic'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.tools).toEqual([
+      {
+        name: 'web_search',
+        input_schema: {
+          type: 'object',
+          properties: {
+            prompt: {
+              type: 'string'
+            }
+          },
+          required: ['prompt']
+        },
+        description: 'Search the web.'
+      }
+    ]);
+  });
 });

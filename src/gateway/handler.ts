@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import type { BillingResult } from '../billing';
 import { buildBillingHeaders, calculateUsageBilling, publishBillingEvent } from '../billing';
@@ -41,12 +42,19 @@ import {
   readHeader
 } from '../utils';
 import {
+  canRelayOptimisticOpenAIChatStream,
   collectAnthropicNonStreamPayloadFromEventStream,
   collectOpenAINonStreamPayloadFromEventStream,
+  createOptimisticOpenAIChatStreamRelay,
+  finalizeOptimisticOpenAIChatStreamRelay,
+  relayOptimisticOpenAIChatStreamTurn,
   relayConvertedStreamFromStandardResponse,
   relayConvertedStreamFromUpstreamResponse
 } from './streaming-conversion';
-import { addNamespaceFieldsToStandardResponse } from '../adapters/builtins/target/tools';
+import {
+  addNamespaceFieldsToStandardResponse,
+  isHostedWebSearchTool
+} from '../adapters/builtins/target/tools';
 import type { GatewayRuntime } from './runtime';
 import { applyHealthAwareRouting } from './health-routing';
 import { evaluateGatewayPolicy, type GatewayPolicyResult } from './policy';
@@ -820,7 +828,10 @@ export async function handleGatewayRequest(
         targetProviderName: targetProviderConfig?.name,
         mode: 'buffered'
       });
-      const upstreamPayload = await safeReadUpstreamPayload(request, targetProvider, upstreamResponse);
+      const upstreamPayload =
+        isEventStreamResponse(upstreamResponse) && targetProvider === 'openai'
+          ? await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse)
+          : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse);
       const responsePluginResult = await applyProviderResponsePlugins(
         providerPluginContext,
         upstreamRequest,
@@ -1821,8 +1832,7 @@ async function handleVirtualModelRequest(
 
     let workingRequest: StandardRequest = {
       ...rewrittenBaseRequest,
-      model,
-      stream: false
+      model
     };
     let aggregatedUsage: StandardUsage = {};
     let internalToolCalls = 0;
@@ -1916,9 +1926,79 @@ async function handleVirtualModelRequest(
       upstreamAttemptSequence += 1;
       lastAttemptSequence = upstreamAttemptSequence;
 
+      if (
+        isStreaming &&
+        !mergedToolingResult.hasInternalTools &&
+        upstreamResponse.ok &&
+        canTreatAsLiveStreamResponse(source, targetProvider, upstreamResponse)
+      ) {
+        recordGatewayStreamConversion({
+          sourceAdapter: source.adapterKey,
+          targetProvider,
+          targetProviderName: targetProviderConfig?.name,
+          mode: 'live'
+        });
+        const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, upstreamResponse);
+        void tryPublishStreamingBillingEventFromUpstreamResponse(
+          request,
+          reply,
+          config,
+          targetProvider,
+          sourceAdapter.provider,
+          source.adapterKey,
+          attempts.length,
+          lastAttemptSequence,
+          targetAdapter,
+          upstreamRequest,
+          upstreamResponse.clone(),
+          model,
+          targetProviderConfig,
+          rawTraceStreamResponse
+        );
+        attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length);
+        return relayConvertedStreamFromUpstreamResponse(reply, source, upstreamResponse, workingRequest);
+      }
+
+      if (
+        shouldUseOptimisticVirtualModelStream(
+          isStreaming,
+          virtualModel.profile,
+          source,
+          targetProvider,
+          targetProviderConfig,
+          upstreamResponse,
+          mergedToolingResult.toolOwners,
+          providerPlugins
+        )
+      ) {
+        return sendOptimisticVirtualModelStream({
+          reply,
+          request,
+          source,
+          config,
+          runtime,
+          target,
+          targetAdapter,
+          targetProvider,
+          targetProviderConfig,
+          providerPluginContext,
+          virtualModel,
+          mergedToolingResult,
+          multimodalReferences: multimodalRewrite.references,
+          attempts,
+          model,
+          workingRequest,
+          upstreamRequest,
+          upstreamResponse,
+          upstreamAttemptSequence,
+          lastAttemptSequence,
+          fallbackAttempts: attempts.length
+        });
+      }
+
       const upstreamPayload =
-        isEventStreamResponse(upstreamResponse) && targetProvider === 'openai'
-          ? await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse)
+        isEventStreamResponse(upstreamResponse)
+          ? await collectVirtualModelEventStreamPayload(request, targetProvider, upstreamResponse)
           : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse);
       if (!upstreamResponse.ok) {
         loopExhausted = false;
@@ -2213,7 +2293,14 @@ async function buildVirtualTooling(
   | { ok: false; error: string }
 > {
   const normalizedClientTools = Array.isArray(clientTools) ? clientTools : [];
-  if (profile.execution.clientToolsPolicy === 'deny' && normalizedClientTools.length > 0) {
+  const webSearchDeclared = hasClientWebSearchDeclaration(normalizedClientTools);
+  const policyClientTools = normalizedClientTools.filter(
+    (tool) => !shouldConsumeClientWebSearchDeclaration(tool, profile)
+  );
+  const profileTools = profile.tools.filter(
+    (tool) => !(shouldRequireClientWebSearchDeclaration(tool.name, profile) && !webSearchDeclared)
+  );
+  if (profile.execution.clientToolsPolicy === 'deny' && policyClientTools.length > 0) {
     return {
       ok: false,
       error: `Virtual model profile ${profile.key} does not allow client supplied tools.`
@@ -2226,7 +2313,7 @@ async function buildVirtualTooling(
 
   let toolCatalog = new Map<string, { description?: string; inputSchema?: Record<string, unknown> }>();
   let toolDefinitions: AgentToolDefinition[] = [];
-  if (profile.tools.length > 0) {
+  if (profileTools.length > 0) {
     if (!runtime.toolProvider) {
       return {
         ok: false,
@@ -2246,7 +2333,7 @@ async function buildVirtualTooling(
     );
   }
 
-  for (const tool of profile.tools) {
+  for (const tool of profileTools) {
     const resolvedTool = resolveVirtualProfileToolDefinition(tool.name, toolDefinitions);
     if (!resolvedTool) {
       return {
@@ -2293,6 +2380,10 @@ async function buildVirtualTooling(
   }
 
   for (const tool of normalizedClientTools) {
+    if (shouldConsumeClientWebSearchDeclaration(tool, profile)) {
+      continue;
+    }
+
     const toolName = extractStandardToolName(tool);
     if (!toolName) {
       mergedTools.push(tool);
@@ -2319,6 +2410,33 @@ async function buildVirtualTooling(
     toolOwners,
     hasInternalTools
   };
+}
+
+function hasClientWebSearchDeclaration(tools: unknown[]): boolean {
+  return tools.some((tool) => isHostedWebSearchTool(tool) || isClientWebSearchFunctionTool(tool));
+}
+
+function shouldRequireClientWebSearchDeclaration(
+  toolName: string,
+  profile: VirtualModelProfileConfig
+): boolean {
+  return profile.execution.matchWebSearch && isVirtualWebSearchToolName(toolName);
+}
+
+function shouldConsumeClientWebSearchDeclaration(
+  tool: unknown,
+  profile: VirtualModelProfileConfig
+): boolean {
+  return profile.execution.matchWebSearch && (isHostedWebSearchTool(tool) || isClientWebSearchFunctionTool(tool));
+}
+
+function isClientWebSearchFunctionTool(tool: unknown): boolean {
+  const toolName = extractStandardToolName(tool);
+  return Boolean(toolName && isVirtualWebSearchToolName(toolName));
+}
+
+function hasClientVisibleVirtualToolOwners(toolOwners: Map<string, VirtualToolOwner>): boolean {
+  return [...toolOwners.values()].some((owner) => owner.visibility !== 'internal');
 }
 
 async function executeInternalVirtualToolCalls(
@@ -3087,6 +3205,335 @@ function appendVirtualToolResultsToRequest(
       }
     ]
   };
+}
+
+function shouldUseOptimisticVirtualModelStream(
+  streaming: boolean,
+  profile: VirtualModelProfileConfig,
+  source: GatewaySourceContext,
+  targetProvider: Provider,
+  targetProviderConfig: ProviderConfig | undefined,
+  upstreamResponse: Response,
+  toolOwners: Map<string, VirtualToolOwner>,
+  providerPlugins: ProviderPlugin[]
+): boolean {
+  if (!streaming || profile.execution.streamMode !== 'optimistic') {
+    return false;
+  }
+
+  if (targetProvider !== 'openai' || targetProviderConfig?.type !== 'openai_chat_completions') {
+    return false;
+  }
+
+  if (!isEventStreamResponse(upstreamResponse) || !canRelayOptimisticOpenAIChatStream(source)) {
+    return false;
+  }
+
+  if (hasClientVisibleVirtualToolOwners(toolOwners)) {
+    return false;
+  }
+
+  return !providerPlugins.some((plugin) => Boolean(plugin.transformResponse));
+}
+
+function sendOptimisticVirtualModelStream(input: {
+  reply: FastifyReply;
+  request: FastifyRequest;
+  source: GatewaySourceContext;
+  config: GatewayConfig;
+  runtime: GatewayRuntime;
+  target: TargetProviderRoute;
+  targetAdapter: TargetAdapter;
+  targetProvider: Provider;
+  targetProviderConfig?: ProviderConfig;
+  providerPluginContext: ProviderPluginExecutionContext;
+  virtualModel: VirtualModelResolution;
+  mergedToolingResult: {
+    toolOwners: Map<string, VirtualToolOwner>;
+  };
+  multimodalReferences: VirtualMultimodalReference[];
+  attempts: ProviderAttemptFailure[];
+  model: string;
+  workingRequest: StandardRequest;
+  upstreamRequest: UpstreamRequest;
+  upstreamResponse: Response;
+  upstreamAttemptSequence: number;
+  lastAttemptSequence: number;
+  fallbackAttempts: number;
+}) {
+  attachTargetRoutingHeaders(
+    input.reply,
+    input.targetProvider,
+    input.targetProviderConfig?.name,
+    input.fallbackAttempts
+  );
+  input.reply.code(200);
+  input.reply.header('content-type', 'text/event-stream; charset=utf-8');
+  input.reply.header('cache-control', 'no-cache, no-transform');
+  input.reply.header('connection', 'keep-alive');
+  input.reply.header('x-accel-buffering', 'no');
+
+  return input.reply.send(Readable.from(runOptimisticVirtualModelStream(input)));
+}
+
+async function* runOptimisticVirtualModelStream(input: {
+  request: FastifyRequest;
+  source: GatewaySourceContext;
+  config: GatewayConfig;
+  runtime: GatewayRuntime;
+  target: TargetProviderRoute;
+  targetAdapter: TargetAdapter;
+  targetProvider: Provider;
+  targetProviderConfig?: ProviderConfig;
+  providerPluginContext: ProviderPluginExecutionContext;
+  virtualModel: VirtualModelResolution;
+  mergedToolingResult: {
+    toolOwners: Map<string, VirtualToolOwner>;
+  };
+  multimodalReferences: VirtualMultimodalReference[];
+  attempts: ProviderAttemptFailure[];
+  model: string;
+  workingRequest: StandardRequest;
+  upstreamRequest: UpstreamRequest;
+  upstreamResponse: Response;
+  upstreamAttemptSequence: number;
+  lastAttemptSequence: number;
+}): AsyncGenerator<string> {
+  const relay = createOptimisticOpenAIChatStreamRelay(input.source, input.workingRequest);
+  if (!relay) {
+    yield* buildOptimisticVirtualModelStreamErrorFrames(input.source, 'Optimistic stream relay is not available.');
+    return;
+  }
+
+  let workingRequest = input.workingRequest;
+  let upstreamRequest = input.upstreamRequest;
+  let upstreamResponse = input.upstreamResponse;
+  let upstreamAttemptSequence = input.upstreamAttemptSequence;
+  let lastAttemptSequence = input.lastAttemptSequence;
+  let aggregatedUsage: StandardUsage = {};
+  let internalToolCalls = 0;
+
+  try {
+    for (let turn = 0; turn < input.virtualModel.profile.execution.maxTurns; turn += 1) {
+      const turnResult: { upstreamPayload?: Record<string, unknown> } = {};
+      yield* relayOptimisticOpenAIChatStreamTurn(upstreamResponse, relay, turnResult);
+      const upstreamPayload = turnResult.upstreamPayload;
+      if (!upstreamPayload) {
+        yield* buildOptimisticVirtualModelStreamErrorFrames(input.source, 'Upstream stream did not produce a payload.');
+        return;
+      }
+
+      const standardPayload = await normalizeOpenAIPayloadForResponseParseRecovery(
+        input.request,
+        input.targetProvider,
+        upstreamPayload
+      );
+      const standardResponseResult = input.targetAdapter.toStandardResponse(standardPayload);
+      if (!standardResponseResult.ok) {
+        yield* buildOptimisticVirtualModelStreamErrorFrames(input.source, standardResponseResult.error);
+        return;
+      }
+
+      const lastResponse = standardResponseResult.value;
+      aggregatedUsage = mergeStandardUsage(aggregatedUsage, lastResponse.usage);
+      const functionCalls = extractFunctionCallsFromStandardResponse(lastResponse);
+      const callPartition = partitionVirtualFunctionCalls(
+        functionCalls,
+        input.mergedToolingResult.toolOwners
+      );
+
+      if (callPartition.client.length > 0 || callPartition.unknown.length > 0) {
+        yield* buildOptimisticVirtualModelStreamErrorFrames(
+          input.source,
+          'Optimistic virtual model streams do not support client-visible tool calls.'
+        );
+        return;
+      }
+
+      if (callPartition.internal.length === 0) {
+        const finalResponse = filterInternalToolCallsFromStandardResponse(
+          lastResponse,
+          input.mergedToolingResult.toolOwners,
+          aggregatedUsage
+        );
+        publishOptimisticVirtualModelBillingEvent(
+          input,
+          finalResponse,
+          lastAttemptSequence
+        );
+        yield* finalizeOptimisticOpenAIChatStreamRelay(relay, upstreamPayload, finalResponse.usage);
+        return;
+      }
+
+      internalToolCalls += callPartition.internal.length;
+      if (internalToolCalls > input.virtualModel.profile.execution.maxToolCalls) {
+        yield* buildOptimisticVirtualModelStreamErrorFrames(
+          input.source,
+          `Virtual model tool loop exceeded maxToolCalls=${input.virtualModel.profile.execution.maxToolCalls}.`
+        );
+        return;
+      }
+
+      const toolResults = await executeInternalVirtualToolCalls(
+        input.runtime,
+        input.virtualModel.profile,
+        callPartition.internal,
+        input.mergedToolingResult.toolOwners,
+        input.multimodalReferences
+      );
+      aggregatedUsage = addServerToolUseToStandardUsage(
+        aggregatedUsage,
+        countInternalWebSearchToolCalls(input.virtualModel.profile, callPartition.internal)
+      );
+      workingRequest = appendVirtualToolResultsToRequest(
+        workingRequest,
+        lastResponse,
+        callPartition.internal,
+        toolResults
+      );
+
+      const targetRequestResult = input.targetAdapter.buildRequestFromStandard({
+        request: input.request,
+        standardRequest: workingRequest,
+        config: input.config,
+        targetProviderConfig: input.targetProviderConfig
+      });
+      if (!targetRequestResult.ok) {
+        yield* buildOptimisticVirtualModelStreamErrorFrames(input.source, targetRequestResult.error);
+        return;
+      }
+
+      const baseUpstreamRequest = applyProviderRequestOverrides(
+        input.config,
+        input.target,
+        input.model,
+        targetRequestResult.value
+      );
+      const upstreamDispatchResult = await dispatchUpstreamRequest(
+        input.providerPluginContext,
+        baseUpstreamRequest,
+        input.config.upstreamTimeoutMs,
+        workingRequest
+      );
+      if (!upstreamDispatchResult.ok) {
+        yield* buildOptimisticVirtualModelStreamErrorFrames(input.source, upstreamDispatchResult.message);
+        return;
+      }
+
+      upstreamRequest = upstreamDispatchResult.upstreamRequest;
+      upstreamResponse = upstreamDispatchResult.upstreamResponse;
+      upstreamAttemptSequence += 1;
+      lastAttemptSequence = upstreamAttemptSequence;
+
+      if (!upstreamResponse.ok || !isEventStreamResponse(upstreamResponse)) {
+        yield* buildOptimisticVirtualModelStreamErrorFrames(
+          input.source,
+          'Optimistic virtual model stream expected a successful event-stream response.'
+        );
+        return;
+      }
+    }
+
+    void upstreamRequest;
+    void lastAttemptSequence;
+    yield* buildOptimisticVirtualModelStreamErrorFrames(
+      input.source,
+      `Virtual model tool loop exceeded maxTurns=${input.virtualModel.profile.execution.maxTurns}.`
+    );
+  } catch (error) {
+    const details = formatOptimisticVirtualModelStreamError(error);
+    input.request.log.warn(
+      {
+        provider: input.targetProvider,
+        providerName: input.targetProviderConfig?.name,
+        sourceAdapterKey: input.source.adapterKey,
+        details
+      },
+      'Optimistic virtual model stream failed after partial relay.'
+    );
+    yield* buildOptimisticVirtualModelStreamErrorFrames(
+      input.source,
+      `Optimistic virtual model stream failed: ${details}`
+    );
+  }
+}
+
+function buildOptimisticVirtualModelStreamErrorFrames(
+  source: GatewaySourceContext,
+  message: string
+): string[] {
+  const payload = JSON.stringify({
+    type: 'error',
+    error: {
+      message
+    }
+  });
+
+  if (source.adapterKey === 'openai_responses') {
+    return [`data: ${payload}\n\n`, 'data: [DONE]\n\n'];
+  }
+
+  return [`event: error\ndata: ${payload}\n\n`];
+}
+
+function formatOptimisticVirtualModelStreamError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function publishOptimisticVirtualModelBillingEvent(
+  input: {
+    request: FastifyRequest;
+    reply?: FastifyReply;
+    source: GatewaySourceContext;
+    config: GatewayConfig;
+    targetProvider: Provider;
+    targetProviderConfig?: ProviderConfig;
+    fallbackAttempts?: number;
+    model: string;
+  },
+  response: StandardResponse,
+  attemptSequence: number
+): void {
+  if (!input.config.billing.enabled || !input.reply) {
+    return;
+  }
+
+  const billingModel = resolveBillingModel(response.model, input.model);
+  const billing = calculateUsageBilling(
+    input.targetProvider,
+    response.usage,
+    input.config.billing,
+    resolveProviderBillingRate(input.config, input.targetProvider, billingModel, input.targetProviderConfig)
+  );
+  input.request.log.info(
+    {
+      provider: billing.provider,
+      usage: billing.usage,
+      rates: billing.rates,
+      cost: billing.cost
+    },
+    'Optimistic streaming usage billing computed.'
+  );
+
+  publishBillingEventSafe(
+    input.request,
+    input.reply,
+    input.config,
+    input.source.adapterKey === 'anthropic_messages' ? 'anthropic' : 'openai',
+    input.source.adapterKey,
+    input.targetProvider,
+    billingModel,
+    input.fallbackAttempts ?? 0,
+    {
+      kind: 'upstream_attempt',
+      sequence: attemptSequence
+    },
+    billing,
+    input.targetProviderConfig,
+    buildGatewayBillingTraceSnapshot(input.request, input.reply, {
+      standardResponse: response
+    })
+  );
 }
 
 function sendVirtualModelResponse(
@@ -3987,10 +4434,78 @@ function validateModelForTarget(
     return { ok: true, value: model };
   }
 
+  const providerQualifiedModel = resolveProviderQualifiedModelForTarget(model, providerConfig);
+  if (providerQualifiedModel && providerConfig.models.includes(providerQualifiedModel)) {
+    return { ok: true, value: providerQualifiedModel };
+  }
+
   return {
     ok: false,
     error: `Model "${model}" is not configured for target provider ${formatTargetProviderLabel(target)}. Allowed models: ${providerConfig.models.join(', ')}.`
   };
+}
+
+function resolveProviderQualifiedModelForTarget(
+  model: string,
+  providerConfig: ProviderConfig
+): string | undefined {
+  const slashIndex = model.indexOf('/');
+  if (slashIndex <= 0 || slashIndex >= model.length - 1) {
+    return undefined;
+  }
+
+  const providerHint = model.slice(0, slashIndex).trim();
+  const targetModel = model.slice(slashIndex + 1).trim();
+  if (!providerHint || !targetModel || !providerSelectorMatchesTarget(providerHint, providerConfig)) {
+    return undefined;
+  }
+
+  return targetModel;
+}
+
+function providerSelectorMatchesTarget(providerHint: string, providerConfig: ProviderConfig): boolean {
+  const normalizedHint = providerHint.trim().toLowerCase();
+  if (!normalizedHint) {
+    return false;
+  }
+
+  return providerConfigSelectorAliases(providerConfig).some((alias) => alias.toLowerCase() === normalizedHint);
+}
+
+function providerConfigSelectorAliases(providerConfig: ProviderConfig): string[] {
+  const aliases = [providerConfig.name.trim()].filter(Boolean);
+  const publicName = providerConfigPublicName(providerConfig);
+  if (publicName && !aliases.some((alias) => alias.toLowerCase() === publicName.toLowerCase())) {
+    aliases.push(publicName);
+  }
+  return aliases;
+}
+
+function providerConfigPublicName(providerConfig: ProviderConfig): string | undefined {
+  const name = providerConfig.name.trim();
+  const providerType = providerConfig.type.trim().toLowerCase();
+  const segments = name.split('::').map((segment) => segment.trim());
+  if (segments.length < 2 || !providerType) {
+    return undefined;
+  }
+
+  for (let index = segments.length - 1; index > 0; index -= 1) {
+    if (segments[index]?.toLowerCase() !== providerType) {
+      continue;
+    }
+    const suffixes = segments.slice(index + 1);
+    if (!suffixes.every(isProviderConfigPublicNameSuffix)) {
+      continue;
+    }
+    const publicName = segments.slice(0, index).join('::').trim();
+    return publicName || undefined;
+  }
+
+  return undefined;
+}
+
+function isProviderConfigPublicNameSuffix(segment: string): boolean {
+  return segment.trim().toLowerCase().startsWith('cred:');
 }
 
 function parseProviderRouteList(
@@ -4764,7 +5279,8 @@ function extractOpenAIBillingResponseSnapshot(
       asNumber(inputDetails?.cache_creation_tokens) ??
       asNumber(usageRaw.cache_creation_tokens) ??
       asNumber(usageRaw.cache_write_tokens),
-    cache_duration_seconds: extractBillingCacheDurationSeconds(usageRaw, inputDetails)
+    cache_duration_seconds: extractBillingCacheDurationSeconds(usageRaw, inputDetails),
+    server_tool_use: extractBillingServerToolUse(usageRaw.server_tool_use)
   };
   if (!hasUsageData(usage)) {
     return recoverZeroOpenAIBillingResponseSnapshot(responsePayload);
@@ -4841,7 +5357,8 @@ function extractAnthropicBillingResponseSnapshot(
       ),
     cache_read_tokens: cacheReadTokens,
     cache_write_tokens: cacheWriteTokens,
-    cache_duration_seconds: extractBillingCacheDurationSeconds(usageRaw)
+    cache_duration_seconds: extractBillingCacheDurationSeconds(usageRaw),
+    server_tool_use: extractBillingServerToolUse(usageRaw.server_tool_use)
   };
   if (!hasUsageData(usage)) {
     return undefined;
@@ -4891,8 +5408,25 @@ function hasUsageData(usage: StandardUsage): boolean {
     usage.cache_write_tokens !== undefined ||
     usage.cache_duration_seconds !== undefined ||
     usage.cache_ttl_seconds !== undefined ||
-    usage.cache_age_seconds !== undefined
+    usage.cache_age_seconds !== undefined ||
+    usage.server_tool_use?.web_search_requests !== undefined ||
+    usage.server_tool_use?.web_fetch_requests !== undefined
   );
+}
+
+function extractBillingServerToolUse(value: unknown): StandardUsage['server_tool_use'] {
+  if (!isObject(value)) {
+    return undefined;
+  }
+
+  const serverToolUse = {
+    web_search_requests: asNumber(value.web_search_requests),
+    web_fetch_requests: asNumber(value.web_fetch_requests)
+  };
+
+  return Object.values(serverToolUse).some((count) => count !== undefined)
+    ? serverToolUse
+    : undefined;
 }
 
 function sumOptionalUsageTokens(...values: Array<number | undefined>): number | undefined {
@@ -5197,6 +5731,37 @@ async function safeReadUpstreamPayload(
       read_error: details
     };
   }
+}
+
+async function collectVirtualModelEventStreamPayload(
+  request: FastifyRequest,
+  provider: Provider,
+  upstreamResponse: Response
+): Promise<unknown> {
+  try {
+    if (provider === 'openai') {
+      return await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse);
+    }
+
+    if (provider === 'anthropic') {
+      return await collectAnthropicNonStreamPayloadFromEventStream(upstreamResponse);
+    }
+  } catch (error) {
+    const details = error instanceof Error ? error.message : String(error);
+    request.log.warn(
+      {
+        provider,
+        details
+      },
+      'Failed to collect upstream event stream payload.'
+    );
+
+    return {
+      read_error: details
+    };
+  }
+
+  return safeReadUpstreamPayload(request, provider, upstreamResponse);
 }
 
 async function applyProviderRequestPlugins(

@@ -10,7 +10,8 @@ import {
 } from './handler';
 import {
   collectAnthropicNonStreamPayloadFromEventStream,
-  collectOpenAINonStreamPayloadFromEventStream
+  collectOpenAINonStreamPayloadFromEventStream,
+  relayConvertedStreamFromStandardResponse
 } from './streaming-conversion';
 
 describe('resolveBillingResponseSnapshot', () => {
@@ -115,6 +116,51 @@ describe('resolveBillingResponseSnapshot', () => {
     });
   });
 
+  it('preserves openai output items when completed stream response has empty output', async () => {
+    const upstreamPayload = await collectOpenAINonStreamPayloadFromEventStream(
+      createSseResponse([
+        'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_item_stream","object":"response","model":"gpt-5.4"}}\n\n',
+        'event: response.output_text.done\ndata: {"type":"response.output_text.done","output_index":0,"content_index":0,"item_id":"msg_item_stream","text":"hello from item"}\n\n',
+        'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_item_stream","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello from item","annotations":[]}]}}\n\n',
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_item_stream","object":"response","model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}\n\n',
+        'data: [DONE]\n\n'
+      ])
+    );
+
+    const result = openAIResponsesTargetAdapter.toStandardResponse(upstreamPayload);
+
+    expect(upstreamPayload).toMatchObject({
+      id: 'resp_item_stream',
+      model: 'gpt-5.4',
+      output_text: 'hello from item',
+      output: [
+        {
+          id: 'msg_item_stream',
+          type: 'message',
+          content: [
+            {
+              type: 'output_text',
+              text: 'hello from item'
+            }
+          ]
+        }
+      ]
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        id: 'resp_item_stream',
+        model: 'gpt-5.4',
+        output_text: 'hello from item',
+        usage: {
+          input_tokens: 3,
+          output_tokens: 2,
+          total_tokens: 5
+        }
+      }
+    });
+  });
+
   it('recovers zero openai usage from empty chat completion stream payloads', async () => {
     const upstreamPayload = await collectOpenAINonStreamPayloadFromEventStream(
       createSseResponse([
@@ -146,7 +192,7 @@ describe('resolveBillingResponseSnapshot', () => {
     const upstreamPayload = await collectAnthropicNonStreamPayloadFromEventStream(
       createSseResponse([
         'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_stream_123","type":"message","role":"assistant","model":"claude-3-5-sonnet-latest","content":[],"usage":{"input_tokens":120,"output_tokens":0,"cache_read_input_tokens":24}}}\n\n',
-        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":18,"cache_creation_input_tokens":12}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":18,"cache_creation_input_tokens":12,"server_tool_use":{"web_search_requests":1}}}\n\n',
         'event: message_stop\ndata: {"type":"message_stop"}\n\n'
       ])
     );
@@ -164,10 +210,219 @@ describe('resolveBillingResponseSnapshot', () => {
           total_tokens: 174,
           cache_read_tokens: 24,
           cache_write_tokens: 12,
-          cache_duration_seconds: undefined
+          cache_duration_seconds: undefined,
+          server_tool_use: {
+            web_search_requests: 1,
+            web_fetch_requests: undefined
+          }
         }
       }
     });
+  });
+
+  it('includes input cache and server tool usage in converted anthropic stream deltas', async () => {
+    const stream = relayConvertedStreamFromStandardResponse(
+      {
+        code() {
+          return this;
+        },
+        header() {
+          return this;
+        },
+        send(payload: unknown) {
+          return payload;
+        }
+      } as never,
+      {
+        adapterKey: 'anthropic_messages'
+      } as never,
+      {
+        id: 'msg_converted_stream_123',
+        object: 'response',
+        status: 'completed',
+        model: 'claude-3-5-sonnet-latest',
+        output_text: 'done',
+        output: [
+          {
+            id: 'msg_item_123',
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [
+              {
+                type: 'output_text',
+                text: 'done',
+                annotations: []
+              }
+            ]
+          }
+        ],
+        usage: {
+          input_tokens: 120,
+          output_tokens: 18,
+          total_tokens: 138,
+          cache_read_tokens: 24,
+          cache_write_tokens: 12,
+          server_tool_use: {
+            web_search_requests: 1
+          }
+        },
+        finish_reason: 'stop'
+      }
+    ) as AsyncIterable<string | Buffer>;
+
+    let body = '';
+    for await (const chunk of stream) {
+      body += chunk.toString();
+    }
+
+    const messageStartLine = body
+      .split('\n')
+      .find((line) => line.startsWith('data: ') && line.includes('"type":"message_start"'));
+    expect(messageStartLine).toBeDefined();
+    const messageStart = JSON.parse(String(messageStartLine).slice('data: '.length));
+    expect(messageStart.message.usage).toEqual({
+      input_tokens: 120,
+      output_tokens: 0,
+      cache_read_input_tokens: 24,
+      cache_creation_input_tokens: 12,
+      server_tool_use: {
+        web_search_requests: 1
+      }
+    });
+
+    const messageDeltaLine = body
+      .split('\n')
+      .find((line) => line.startsWith('data: ') && line.includes('"type":"message_delta"'));
+    expect(messageDeltaLine).toBeDefined();
+    const messageDelta = JSON.parse(String(messageDeltaLine).slice('data: '.length));
+    expect(messageDelta.usage).toEqual({
+      output_tokens: 18,
+      input_tokens: 120,
+      cache_read_input_tokens: 24,
+      cache_creation_input_tokens: 12,
+      server_tool_use: {
+        web_search_requests: 1
+      }
+    });
+  });
+
+  it('preserves anthropic thinking blocks when collecting streaming payloads', async () => {
+    const upstreamPayload = await collectAnthropicNonStreamPayloadFromEventStream(
+      createSseResponse([
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_thinking_stream","type":"message","role":"assistant","model":"claude-3-5-sonnet-latest","content":[],"usage":{"input_tokens":10,"output_tokens":0}}}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"think "}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_123"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      ])
+    );
+
+    const result = anthropicMessagesTargetAdapter.toStandardResponse(upstreamPayload);
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value.output[0]).toMatchObject({
+      type: 'reasoning',
+      content: [
+        {
+          type: 'reasoning_text',
+          text: 'think first'
+        }
+      ],
+      reasoning_details: [
+        {
+          type: 'thinking',
+          thinking: 'think first',
+          signature: 'sig_123'
+        }
+      ]
+    });
+    expect(result.value.output_text).toBe('answer');
+  });
+
+  it('streams standard reasoning as anthropic thinking deltas', async () => {
+    const stream = relayConvertedStreamFromStandardResponse(
+      {
+        code() {
+          return this;
+        },
+        header() {
+          return this;
+        },
+        send(payload: unknown) {
+          return payload;
+        }
+      } as never,
+      {
+        adapterKey: 'anthropic_messages'
+      } as never,
+      {
+        id: 'msg_reasoning_stream',
+        object: 'response',
+        status: 'completed',
+        model: 'claude-3-5-sonnet-latest',
+        output_text: 'answer',
+        output: [
+          {
+            id: 'rs_123',
+            type: 'reasoning',
+            status: 'completed',
+            summary: [],
+            content: [
+              {
+                type: 'reasoning_text',
+                text: 'think first'
+              }
+            ],
+            reasoning_details: [
+              {
+                type: 'thinking',
+                thinking: 'think first',
+                signature: 'sig_123'
+              }
+            ]
+          },
+          {
+            id: 'msg_item_123',
+            type: 'message',
+            role: 'assistant',
+            status: 'completed',
+            content: [
+              {
+                type: 'output_text',
+                text: 'answer',
+                annotations: []
+              }
+            ]
+          }
+        ],
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          total_tokens: 15
+        },
+        finish_reason: 'stop'
+      }
+    ) as AsyncIterable<string | Buffer>;
+
+    let body = '';
+    for await (const chunk of stream) {
+      body += chunk.toString();
+    }
+
+    expect(body).toContain('"type":"thinking_delta","thinking":"think first"');
+    expect(body).toContain('"type":"signature_delta","signature":"sig_123"');
+    expect(body).toContain('"type":"text_delta","text":"answer"');
   });
 });
 

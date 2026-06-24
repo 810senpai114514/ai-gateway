@@ -9,14 +9,18 @@ import {
   normalizeOpenAIResponsesCompletedResponse,
   normalizeOpenAIResponsesUsage
 } from '../adapters/builtins/common';
-import { formatGeminiGenerateContentResponse } from '../adapters/builtins/source/formatters';
+import {
+  formatAnthropicMessagesResponse,
+  formatGeminiGenerateContentResponse
+} from '../adapters/builtins/source/formatters';
 import { splitNamespacedToolCallName } from '../adapters/builtins/target/tools';
 import { parseSseChunks } from '../sse';
 import type {
   GatewaySourceContext,
   StandardRequest,
   StandardResponse,
-  StandardResponseReasoning
+  StandardResponseReasoning,
+  StandardUsage
 } from '../types';
 import { asNumber, asString, isObject } from '../utils';
 
@@ -87,6 +91,10 @@ interface AnthropicRelayState {
   outputTokens: number;
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
+  serverToolUse?: {
+    web_search_requests?: number;
+    web_fetch_requests?: number;
+  };
   finishReason?: string;
   activeBlockType?: AnthropicContentBlockType;
   activeBlockIndex?: number;
@@ -122,6 +130,7 @@ interface OpenAIChatRelayState {
     completionTokens?: number;
     totalTokens?: number;
     cachedPromptTokens?: number;
+    cacheCreationPromptTokens?: number;
   };
 }
 
@@ -148,11 +157,45 @@ interface OpenAIReasoningAccumulator {
   rawDetails: unknown[];
 }
 
+interface OpenAINonStreamCollectionState {
+  id: string;
+  model: string;
+  outputText: string;
+  finishReason?: string;
+  usage: Record<string, unknown>;
+  completedResponse?: Record<string, unknown>;
+  outputItems: Record<string, unknown>[];
+  toolCalls: Map<number, OpenAIStreamToolCallAccumulator>;
+  reasoning: OpenAIReasoningAccumulator;
+}
+
 interface AnthropicStreamToolUseAccumulator {
   id: string;
   name: string;
   inputJson: string;
 }
+
+interface AnthropicStreamThinkingAccumulator {
+  type: 'thinking' | 'redacted_thinking';
+  thinking: string;
+  data?: string;
+  signature?: string;
+}
+
+export interface OptimisticOpenAIChatStreamTurnResult {
+  upstreamPayload?: Record<string, unknown>;
+}
+
+type OptimisticOpenAIChatRelay =
+  | {
+      sourceAdapterKey: 'openai_responses';
+      state: OpenAIResponsesRelayState;
+      tools?: unknown[];
+    }
+  | {
+      sourceAdapterKey: 'anthropic_messages';
+      state: AnthropicRelayState;
+    };
 
 export function relayConvertedStreamFromStandardResponse(
   reply: FastifyReply,
@@ -205,30 +248,225 @@ export function relayConvertedStreamFromUpstreamResponse(
   return reply.send(Readable.fromWeb(upstreamResponse.body as unknown as ReadableStream<Uint8Array>));
 }
 
+export function canRelayOptimisticOpenAIChatStream(source: GatewaySourceContext): boolean {
+  return source.adapterKey === 'openai_responses' || source.adapterKey === 'anthropic_messages';
+}
+
+export function createOptimisticOpenAIChatStreamRelay(
+  source: GatewaySourceContext,
+  standardRequest?: StandardRequest
+): OptimisticOpenAIChatRelay | undefined {
+  if (source.adapterKey === 'openai_responses') {
+    return {
+      sourceAdapterKey: 'openai_responses',
+      tools: standardRequest?.tools,
+      state: {
+        started: false,
+        finished: false,
+        responseId: `resp_${randomUUID()}`,
+        model: 'unknown',
+        outputText: '',
+        reasoningItemId: `rs_${randomUUID().replace(/-/g, '')}`,
+        reasoningText: '',
+        reasoningSummaryText: '',
+        reasoningItemStarted: false,
+        reasoningSummaryStarted: false,
+        messageItemId: `msg_${randomUUID()}`,
+        messageOutputIndex: undefined,
+        messageItemStarted: false,
+        messageContentStarted: false,
+        pendingToolCalls: new Map(),
+        usedOutputIndices: new Set(),
+        nextOutputIndex: 0,
+        usage: {}
+      }
+    };
+  }
+
+  if (source.adapterKey === 'anthropic_messages') {
+    return {
+      sourceAdapterKey: 'anthropic_messages',
+      state: {
+        started: false,
+        finished: false,
+        messageId: `msg_${randomUUID()}`,
+        model: 'unknown',
+        outputTokens: 0,
+        nextBlockIndex: 0,
+        pendingToolCalls: new Map()
+      }
+    };
+  }
+
+  return undefined;
+}
+
+export async function* relayOptimisticOpenAIChatStreamTurn(
+  upstreamResponse: Response,
+  relay: OptimisticOpenAIChatRelay,
+  result: OptimisticOpenAIChatStreamTurnResult
+): AsyncGenerator<string> {
+  const collectionState = createOpenAINonStreamCollectionState();
+
+  for await (const chunk of parseSseChunks(upstreamResponse)) {
+    const data = chunk.data.trim();
+    if (!data || data === '[DONE]') {
+      continue;
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    if (!isObject(payload) || isOpenAIResponsesStreamEvent(payload)) {
+      continue;
+    }
+
+    collectOpenAINonStreamStateFromChatChunk(collectionState, payload);
+    const sanitizedPayload = stripOpenAIChatChunkToolCallsAndFinish(payload);
+    if (!sanitizedPayload) {
+      continue;
+    }
+
+    const frames =
+      relay.sourceAdapterKey === 'openai_responses'
+        ? emitOpenAIResponsesFramesFromChatChunk(relay.state, sanitizedPayload, relay.tools)
+        : emitAnthropicFramesFromOpenAIChatChunk(relay.state, sanitizedPayload);
+    for (const frame of frames) {
+      yield frame;
+    }
+  }
+
+  result.upstreamPayload = buildOpenAINonStreamPayloadFromCollectionState(collectionState);
+}
+
+export function finalizeOptimisticOpenAIChatStreamRelay(
+  relay: OptimisticOpenAIChatRelay,
+  finalPayload: Record<string, unknown>,
+  usage?: StandardUsage
+): string[] {
+  const firstChoice = Array.isArray(finalPayload.choices) && isObject(finalPayload.choices[0])
+    ? finalPayload.choices[0]
+    : undefined;
+  const finishReason = asString(firstChoice?.finish_reason);
+
+  if (relay.sourceAdapterKey === 'openai_responses') {
+    if (usage) {
+      relay.state.usage = buildOpenAIResponsesUsageFromStandardUsage(usage);
+    }
+    if (finishReason) {
+      relay.state.finishReason = finishReason;
+    }
+    return [...finalizeOpenAIResponsesRelay(relay.state), 'data: [DONE]\n\n'];
+  }
+
+  if (usage) {
+    applyStandardUsageToAnthropicRelayState(relay.state, usage);
+  }
+  if (finishReason) {
+    relay.state.finishReason = finishReason;
+  }
+  return [...flushPendingAnthropicToolCalls(relay.state), ...finalizeAnthropicRelay(relay.state)];
+}
+
+function buildOpenAIResponsesUsageFromStandardUsage(usage: StandardUsage): Record<string, unknown> {
+  const inputDetails: Record<string, unknown> = {};
+  if (usage.cache_read_tokens !== undefined) {
+    inputDetails.cached_tokens = usage.cache_read_tokens;
+  }
+  if (usage.cache_write_tokens !== undefined) {
+    inputDetails.cache_creation_tokens = usage.cache_write_tokens;
+  }
+
+  return {
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+    total_tokens: usage.total_tokens,
+    ...(Object.keys(inputDetails).length > 0 ? { input_tokens_details: inputDetails } : {}),
+    ...(usage.server_tool_use ? { server_tool_use: usage.server_tool_use } : {})
+  };
+}
+
+function applyStandardUsageToAnthropicRelayState(
+  state: AnthropicRelayState,
+  usage: StandardUsage
+): void {
+  state.inputTokens = usage.input_tokens;
+  state.outputTokens = usage.output_tokens ?? state.outputTokens;
+  state.cacheReadInputTokens = usage.cache_read_tokens;
+  state.cacheCreationInputTokens = usage.cache_write_tokens;
+  state.serverToolUse = usage.server_tool_use;
+}
+
+function stripOpenAIChatChunkToolCallsAndFinish(
+  payload: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  const choicesRaw = Array.isArray(payload.choices) ? payload.choices : [];
+  const choices: unknown[] = [];
+  let keptChoiceData = false;
+
+  for (const choiceRaw of choicesRaw) {
+    if (!isObject(choiceRaw)) {
+      continue;
+    }
+
+    const choice: Record<string, unknown> = {
+      ...choiceRaw
+    };
+    delete choice.finish_reason;
+
+    const delta = isObject(choiceRaw.delta) ? { ...choiceRaw.delta } : undefined;
+    if (delta) {
+      delete delta.tool_calls;
+      if (Object.keys(delta).length > 0) {
+        choice.delta = delta;
+        keptChoiceData = true;
+      } else {
+        delete choice.delta;
+      }
+    }
+
+    const message = isObject(choiceRaw.message) ? { ...choiceRaw.message } : undefined;
+    if (message) {
+      delete message.tool_calls;
+      if (Object.keys(message).length > 0) {
+        choice.message = message;
+        keptChoiceData = true;
+      } else {
+        delete choice.message;
+      }
+    }
+
+    const hasNonEmptyChoice = Object.keys(choice).some((key) => {
+      if (key === 'index') {
+        return false;
+      }
+      return choice[key] !== undefined;
+    });
+    if (hasNonEmptyChoice) {
+      choices.push(choice);
+    }
+  }
+
+  const usage = isObject(payload.usage) ? payload.usage : undefined;
+  if (!keptChoiceData && !usage) {
+    return undefined;
+  }
+
+  return {
+    ...payload,
+    choices,
+    ...(usage ? { usage } : {})
+  };
+}
+
 export async function collectOpenAINonStreamPayloadFromEventStream(
   upstreamResponse: Response
 ): Promise<Record<string, unknown>> {
-  const state: {
-    id: string;
-    model: string;
-    outputText: string;
-    finishReason?: string;
-    usage: Record<string, unknown>;
-    completedResponse?: Record<string, unknown>;
-    toolCalls: Map<number, OpenAIStreamToolCallAccumulator>;
-    reasoning: OpenAIReasoningAccumulator;
-  } = {
-    id: `chatcmpl_${randomUUID()}`,
-    model: 'unknown',
-    outputText: '',
-    usage: {},
-    toolCalls: new Map(),
-    reasoning: {
-      text: '',
-      summary: '',
-      rawDetails: []
-    }
-  };
+  const state = createOpenAINonStreamCollectionState();
 
   for await (const chunk of parseSseChunks(upstreamResponse)) {
     const data = chunk.data.trim();
@@ -255,8 +493,40 @@ export async function collectOpenAINonStreamPayloadFromEventStream(
     collectOpenAINonStreamStateFromChatChunk(state, payload);
   }
 
+  return buildOpenAINonStreamPayloadFromCollectionState(state);
+}
+
+function createOpenAINonStreamCollectionState(): OpenAINonStreamCollectionState {
+  return {
+    id: `chatcmpl_${randomUUID()}`,
+    model: 'unknown',
+    outputText: '',
+    usage: {},
+    outputItems: [],
+    toolCalls: new Map(),
+    reasoning: {
+      text: '',
+      summary: '',
+      rawDetails: []
+    }
+  };
+}
+
+function buildOpenAINonStreamPayloadFromCollectionState(
+  state: OpenAINonStreamCollectionState
+): Record<string, unknown> {
   if (state.completedResponse) {
-    return normalizeOpenAIResponsesCompletedResponse({ ...state.completedResponse });
+    const completedResponse = { ...state.completedResponse };
+    const output = Array.isArray(completedResponse.output) ? completedResponse.output : [];
+    if (output.length === 0 && state.outputItems.length > 0) {
+      completedResponse.output = state.outputItems;
+    }
+    if (!asString(completedResponse.output_text) && state.outputText) {
+      completedResponse.output_text = state.outputText;
+    }
+    const usage = isObject(completedResponse.usage) ? completedResponse.usage : undefined;
+    completedResponse.usage = usage ? { ...state.usage, ...usage } : state.usage;
+    return normalizeOpenAIResponsesCompletedResponse(completedResponse);
   }
 
   return {
@@ -306,13 +576,16 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
     stopReason?: string;
     usage: Record<string, unknown>;
     toolBlocks: Map<number, AnthropicStreamToolUseAccumulator>;
+    thinkingBlocks: Map<number, AnthropicStreamThinkingAccumulator>;
     activeToolBlockIndex?: number;
+    activeThinkingBlockIndex?: number;
   } = {
     id: `msg_${randomUUID()}`,
     model: 'unknown',
     outputText: '',
     usage: {},
-    toolBlocks: new Map()
+    toolBlocks: new Map(),
+    thinkingBlocks: new Map()
   };
 
   for await (const chunk of parseSseChunks(upstreamResponse)) {
@@ -367,6 +640,20 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
           });
           state.activeToolBlockIndex = blockIndex;
         }
+      } else if (asString(block?.type) === 'thinking' && blockIndex !== undefined) {
+        state.thinkingBlocks.set(blockIndex, {
+          type: 'thinking',
+          thinking: asString(block?.thinking) || '',
+          signature: asString(block?.signature)
+        });
+        state.activeThinkingBlockIndex = blockIndex;
+      } else if (asString(block?.type) === 'redacted_thinking' && blockIndex !== undefined) {
+        state.thinkingBlocks.set(blockIndex, {
+          type: 'redacted_thinking',
+          thinking: '',
+          data: asString(block?.data)
+        });
+        state.activeThinkingBlockIndex = blockIndex;
       }
       continue;
     }
@@ -377,6 +664,24 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
         const text = asString(delta?.text);
         if (text) {
           state.outputText += text;
+        }
+      } else if (asString(delta?.type) === 'thinking_delta') {
+        const blockIndex = asNumber(payload.index) ?? state.activeThinkingBlockIndex;
+        const thinking = asString(delta?.thinking);
+        if (blockIndex !== undefined && thinking) {
+          const thinkingBlock = state.thinkingBlocks.get(blockIndex);
+          if (thinkingBlock) {
+            thinkingBlock.thinking += thinking;
+          }
+        }
+      } else if (asString(delta?.type) === 'signature_delta') {
+        const blockIndex = asNumber(payload.index) ?? state.activeThinkingBlockIndex;
+        const signature = asString(delta?.signature);
+        if (blockIndex !== undefined && signature) {
+          const thinkingBlock = state.thinkingBlocks.get(blockIndex);
+          if (thinkingBlock) {
+            thinkingBlock.signature = signature;
+          }
         }
       } else if (asString(delta?.type) === 'input_json_delta') {
         const blockIndex = asNumber(payload.index) ?? state.activeToolBlockIndex;
@@ -402,14 +707,34 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
     }
   }
 
-  const content: Array<Record<string, unknown>> = state.outputText
-    ? [
-        {
-          type: 'text',
-          text: state.outputText
-        }
-      ]
-    : [];
+  const content: Array<Record<string, unknown>> = [];
+  for (const thinkingBlock of [...state.thinkingBlocks.entries()].sort((a, b) => a[0] - b[0])) {
+    const block = thinkingBlock[1];
+    if (block.type === 'redacted_thinking') {
+      if (block.data) {
+        content.push({
+          type: 'redacted_thinking',
+          data: block.data
+        });
+      }
+      continue;
+    }
+
+    if (!block.thinking) {
+      continue;
+    }
+    content.push({
+      type: 'thinking',
+      thinking: block.thinking,
+      ...(block.signature ? { signature: block.signature } : {})
+    });
+  }
+  if (state.outputText) {
+    content.push({
+      type: 'text',
+      text: state.outputText
+    });
+  }
   for (const toolBlock of [...state.toolBlocks.values()]) {
     content.push({
       type: 'tool_use',
@@ -489,6 +814,95 @@ function mergeAnthropicUsageSnapshot(
   if (cacheWriteTokens !== undefined) {
     target.cache_creation_input_tokens = cacheWriteTokens;
   }
+
+  const serverToolUse = extractServerToolUse(usage.server_tool_use);
+  if (serverToolUse) {
+    target.server_tool_use = serverToolUse;
+  }
+}
+
+function buildOpenAIChatUsage(usage: StandardResponse['usage']): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    prompt_tokens: usage.input_tokens,
+    completion_tokens: usage.output_tokens,
+    total_tokens: usage.total_tokens
+  };
+
+  const promptTokenDetails: Record<string, unknown> = {};
+  if (usage.cache_read_tokens !== undefined) {
+    promptTokenDetails.cached_tokens = usage.cache_read_tokens;
+  }
+  if (usage.cache_write_tokens !== undefined) {
+    promptTokenDetails.cache_creation_tokens = usage.cache_write_tokens;
+  }
+  if (Object.keys(promptTokenDetails).length > 0) {
+    payload.prompt_tokens_details = promptTokenDetails;
+  }
+
+  return payload;
+}
+
+function buildAnthropicMessageStartUsage(usage: StandardResponse['usage']): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    input_tokens: usage.input_tokens ?? 0,
+    output_tokens: 0
+  };
+  addStandardCacheUsageToAnthropicUsage(payload, usage);
+  addServerToolUseToAnthropicUsage(payload, usage.server_tool_use);
+  return payload;
+}
+
+function buildAnthropicMessageDeltaUsageFromStandard(usage: StandardResponse['usage']): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    output_tokens: usage.output_tokens ?? 0
+  };
+  if (usage.input_tokens !== undefined) {
+    payload.input_tokens = usage.input_tokens;
+  }
+  addStandardCacheUsageToAnthropicUsage(payload, usage);
+  addServerToolUseToAnthropicUsage(payload, usage.server_tool_use);
+  return payload;
+}
+
+function addStandardCacheUsageToAnthropicUsage(
+  payload: Record<string, unknown>,
+  usage: StandardResponse['usage']
+): void {
+  if (usage.cache_read_tokens !== undefined) {
+    payload.cache_read_input_tokens = usage.cache_read_tokens;
+  }
+  if (usage.cache_write_tokens !== undefined) {
+    payload.cache_creation_input_tokens = usage.cache_write_tokens;
+  }
+}
+
+function addServerToolUseToAnthropicUsage(
+  payload: Record<string, unknown>,
+  serverToolUse: StandardResponse['usage']['server_tool_use']
+): void {
+  const normalized = extractServerToolUse(serverToolUse);
+  if (normalized) {
+    payload.server_tool_use = normalized;
+  }
+}
+
+function extractServerToolUse(value: unknown): StandardResponse['usage']['server_tool_use'] {
+  if (!isObject(value)) {
+    return undefined;
+  }
+
+  const serverToolUse: NonNullable<StandardResponse['usage']['server_tool_use']> = {};
+  const webSearchRequests = asNumber(value.web_search_requests);
+  if (webSearchRequests !== undefined) {
+    serverToolUse.web_search_requests = Math.max(0, Math.trunc(webSearchRequests));
+  }
+
+  const webFetchRequests = asNumber(value.web_fetch_requests);
+  if (webFetchRequests !== undefined) {
+    serverToolUse.web_fetch_requests = Math.max(0, Math.trunc(webFetchRequests));
+  }
+
+  return Object.keys(serverToolUse).length > 0 ? serverToolUse : undefined;
 }
 
 function buildOpenAIChatStreamFrames(standardResponse: StandardResponse): string[] {
@@ -580,16 +994,7 @@ function buildOpenAIChatStreamFrames(standardResponse: StandardResponse): string
     );
   }
 
-  const usage: Record<string, unknown> = {
-    prompt_tokens: standardResponse.usage.input_tokens,
-    completion_tokens: standardResponse.usage.output_tokens,
-    total_tokens: standardResponse.usage.total_tokens
-  };
-  if (standardResponse.usage.cache_read_tokens !== undefined) {
-    usage.prompt_tokens_details = {
-      cached_tokens: standardResponse.usage.cache_read_tokens
-    };
-  }
+  const usage = buildOpenAIChatUsage(standardResponse.usage);
 
   frames.push(
     encodeSseData({
@@ -930,6 +1335,7 @@ function collectStandardResponseReasoningText(standardResponse: StandardResponse
 
 function buildAnthropicMessagesStreamFrames(standardResponse: StandardResponse): string[] {
   const frames: string[] = [];
+  const anthropicPayload = formatAnthropicMessagesResponse(standardResponse);
 
   frames.push(
     encodeSseEvent('message_start', {
@@ -942,42 +1348,15 @@ function buildAnthropicMessagesStreamFrames(standardResponse: StandardResponse):
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: {
-          input_tokens: standardResponse.usage.input_tokens ?? 0,
-          output_tokens: 0
-        }
+        usage: buildAnthropicMessageStartUsage(standardResponse.usage)
       }
     })
   );
 
-  frames.push(
-    encodeSseEvent('content_block_start', {
-      type: 'content_block_start',
-      index: 0,
-      content_block: {
-        type: 'text',
-        text: ''
-      }
-    })
-  );
-
-  frames.push(
-    encodeSseEvent('content_block_delta', {
-      type: 'content_block_delta',
-      index: 0,
-      delta: {
-        type: 'text_delta',
-        text: standardResponse.output_text
-      }
-    })
-  );
-
-  frames.push(
-    encodeSseEvent('content_block_stop', {
-      type: 'content_block_stop',
-      index: 0
-    })
-  );
+  const contentBlocks = Array.isArray(anthropicPayload.content) ? anthropicPayload.content : [];
+  for (let index = 0; index < contentBlocks.length; index += 1) {
+    frames.push(...buildAnthropicStreamContentBlockFrames(index, contentBlocks[index]));
+  }
 
   frames.push(
     encodeSseEvent('message_delta', {
@@ -986,9 +1365,7 @@ function buildAnthropicMessagesStreamFrames(standardResponse: StandardResponse):
         stop_reason: mapFinishReasonToAnthropic(standardResponse.finish_reason),
         stop_sequence: null
       },
-      usage: {
-        output_tokens: standardResponse.usage.output_tokens ?? 0
-      }
+      usage: buildAnthropicMessageDeltaUsageFromStandard(standardResponse.usage)
     })
   );
 
@@ -998,6 +1375,123 @@ function buildAnthropicMessagesStreamFrames(standardResponse: StandardResponse):
     })
   );
   return frames;
+}
+
+function buildAnthropicStreamContentBlockFrames(index: number, block: unknown): string[] {
+  if (!isObject(block)) {
+    return [];
+  }
+
+  const type = asString(block.type);
+  if (type === 'thinking') {
+    const thinking = asString(block.thinking) || '';
+    const signature = asString(block.signature);
+    const frames = [
+      encodeSseEvent('content_block_start', {
+        type: 'content_block_start',
+        index,
+        content_block: {
+          type: 'thinking',
+          thinking: ''
+        }
+      })
+    ];
+    if (thinking) {
+      frames.push(
+        encodeSseEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: {
+            type: 'thinking_delta',
+            thinking
+          }
+        })
+      );
+    }
+    if (signature) {
+      frames.push(
+        encodeSseEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: {
+            type: 'signature_delta',
+            signature
+          }
+        })
+      );
+    }
+    frames.push(buildAnthropicContentBlockStopFrame(index));
+    return frames;
+  }
+
+  if (type === 'redacted_thinking') {
+    return [
+      encodeSseEvent('content_block_start', {
+        type: 'content_block_start',
+        index,
+        content_block: {
+          type: 'redacted_thinking',
+          data: asString(block.data) || ''
+        }
+      }),
+      buildAnthropicContentBlockStopFrame(index)
+    ];
+  }
+
+  if (type === 'tool_use') {
+    const inputJson = normalizeToolArguments(block.input);
+    const frames = [
+      encodeSseEvent('content_block_start', {
+        type: 'content_block_start',
+        index,
+        content_block: {
+          type: 'tool_use',
+          id: asString(block.id) || `toolu_${randomUUID().replace(/-/g, '')}`,
+          name: asString(block.name) || 'tool',
+          input: {}
+        }
+      })
+    ];
+    if (inputJson && inputJson !== '{}') {
+      frames.push(
+        encodeSseEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: inputJson
+          }
+        })
+      );
+    }
+    frames.push(buildAnthropicContentBlockStopFrame(index));
+    return frames;
+  }
+
+  const text = asString(block.text) || '';
+  return [
+    encodeSseEvent('content_block_start', {
+      type: 'content_block_start',
+      index,
+      content_block: {
+        type: 'text',
+        text: ''
+      }
+    }),
+    ...(text
+      ? [
+          encodeSseEvent('content_block_delta', {
+            type: 'content_block_delta',
+            index,
+            delta: {
+              type: 'text_delta',
+              text
+            }
+          })
+        ]
+      : []),
+    buildAnthropicContentBlockStopFrame(index)
+  ];
 }
 
 function buildGeminiStreamFrames(standardResponse: StandardResponse): string[] {
@@ -1510,10 +2004,18 @@ function finalizeOpenAIChatRelay(state: OpenAIChatRelayState): string[] {
     usage.total_tokens = totalTokens;
   }
 
-  if (state.usage.cachedPromptTokens !== undefined) {
-    usage.prompt_tokens_details = {
-      cached_tokens: state.usage.cachedPromptTokens
-    };
+  if (
+    state.usage.cachedPromptTokens !== undefined ||
+    state.usage.cacheCreationPromptTokens !== undefined
+  ) {
+    const promptTokenDetails: Record<string, unknown> = {};
+    if (state.usage.cachedPromptTokens !== undefined) {
+      promptTokenDetails.cached_tokens = state.usage.cachedPromptTokens;
+    }
+    if (state.usage.cacheCreationPromptTokens !== undefined) {
+      promptTokenDetails.cache_creation_tokens = state.usage.cacheCreationPromptTokens;
+    }
+    usage.prompt_tokens_details = promptTokenDetails;
   }
 
   const finalChunk: Record<string, unknown> = {
@@ -1568,6 +2070,15 @@ function updateOpenAIChatRelayUsageFromAnthropic(
     asNumber(isObject(usage.input_tokens_details) ? usage.input_tokens_details.cached_tokens : undefined);
   if (cachedPromptTokens !== undefined) {
     state.usage.cachedPromptTokens = cachedPromptTokens;
+  }
+
+  const cacheCreationPromptTokens =
+    asNumber(usage.cache_creation_input_tokens) ??
+    asNumber(usage.cache_creation_tokens) ??
+    asNumber(usage.cache_write_tokens) ??
+    asNumber(isObject(usage.input_tokens_details) ? usage.input_tokens_details.cache_creation_tokens : undefined);
+  if (cacheCreationPromptTokens !== undefined) {
+    state.usage.cacheCreationPromptTokens = cacheCreationPromptTokens;
   }
 }
 
@@ -1625,6 +2136,15 @@ function updateOpenAIChatRelayUsageFromOpenAIResponses(
     asNumber(usage.cache_read_tokens);
   if (cachedPromptTokens !== undefined) {
     state.usage.cachedPromptTokens = cachedPromptTokens;
+  }
+
+  const cacheCreationPromptTokens =
+    asNumber(inputDetails?.cache_creation_tokens) ??
+    asNumber(usage.cache_creation_input_tokens) ??
+    asNumber(usage.cache_creation_tokens) ??
+    asNumber(usage.cache_write_tokens);
+  if (cacheCreationPromptTokens !== undefined) {
+    state.usage.cacheCreationPromptTokens = cacheCreationPromptTokens;
   }
 }
 
@@ -2826,6 +3346,18 @@ function updateOpenAIResponsesRelayUsageFromChat(
     };
   }
 
+  const cacheCreationTokens =
+    asNumber(promptDetails?.cache_creation_tokens) ??
+    asNumber(usage.cache_creation_input_tokens) ??
+    asNumber(usage.cache_creation_tokens) ??
+    asNumber(usage.cache_write_tokens);
+  if (cacheCreationTokens !== undefined) {
+    mappedUsage.input_tokens_details = {
+      ...(isObject(mappedUsage.input_tokens_details) ? mappedUsage.input_tokens_details : {}),
+      cache_creation_tokens: cacheCreationTokens
+    };
+  }
+
   state.usage = mappedUsage;
 }
 
@@ -3258,6 +3790,7 @@ function buildAnthropicMessageStartFrame(state: AnthropicRelayState): string {
   if (state.cacheReadInputTokens !== undefined) {
     usage.cache_read_input_tokens = state.cacheReadInputTokens;
   }
+  addServerToolUseToAnthropicUsage(usage, state.serverToolUse);
 
   return encodeSseEvent('message_start', {
     type: 'message_start',
@@ -3287,6 +3820,7 @@ function buildAnthropicMessageDeltaUsage(state: AnthropicRelayState): Record<str
   if (state.cacheReadInputTokens !== undefined) {
     usage.cache_read_input_tokens = state.cacheReadInputTokens;
   }
+  addServerToolUseToAnthropicUsage(usage, state.serverToolUse);
 
   return usage;
 }
@@ -3330,6 +3864,11 @@ function updateAnthropicRelayUsage(
     asNumber(usage.cache_write_tokens);
   if (cacheCreationInputTokens !== undefined) {
     state.cacheCreationInputTokens = cacheCreationInputTokens;
+  }
+
+  const serverToolUse = extractServerToolUse(usage.server_tool_use);
+  if (serverToolUse) {
+    state.serverToolUse = serverToolUse;
   }
 }
 
@@ -3394,6 +3933,7 @@ function collectOpenAINonStreamStateFromResponsesEvent(
     finishReason?: string;
     usage: Record<string, unknown>;
     completedResponse?: Record<string, unknown>;
+    outputItems: Record<string, unknown>[];
     toolCalls: Map<number, OpenAIStreamToolCallAccumulator>;
     reasoning: OpenAIReasoningAccumulator;
   },
@@ -3429,6 +3969,14 @@ function collectOpenAINonStreamStateFromResponsesEvent(
     const text = asString(payload.text);
     if (text) {
       state.outputText = text;
+    }
+    return;
+  }
+
+  if (eventType === 'response.output_item.done') {
+    const item = isObject(payload.item) ? payload.item : undefined;
+    if (item) {
+      state.outputItems.push(item);
     }
     return;
   }

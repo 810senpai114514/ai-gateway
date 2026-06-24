@@ -398,12 +398,15 @@ function buildOpenAIJsonUpstreamRequest(
   model: string | undefined,
   body: Record<string, unknown>
 ): { ok: true; value: UpstreamRequest } | { ok: false; error: string } {
-  const headersResult = buildOpenAIHeaders(request.headers, config);
+  const providerConfig = resolveProviderConfig(config, target);
+  const headersResult = buildOpenAIHeaders(request.headers, {
+    ...config,
+    openaiApiKey: providerConfig?.apikey || config.openaiApiKey
+  });
   if (!headersResult.ok) {
     return headersResult;
   }
 
-  const providerConfig = resolveProviderConfig(config, target);
   const extraHeaders = resolveScopedHeaders(providerConfig, model);
   const extraBody = resolveScopedBody(providerConfig, model);
   let url = `${trimRightSlash(config.openaiBaseUrl)}/${endpoint.endpointPath}`;
@@ -715,10 +718,78 @@ function validateModelForTarget(
     return { ok: true, value: model };
   }
 
+  const providerQualifiedModel = resolveProviderQualifiedModelForTarget(model, providerConfig);
+  if (providerQualifiedModel && providerConfig.models.includes(providerQualifiedModel)) {
+    return { ok: true, value: providerQualifiedModel };
+  }
+
   return {
     ok: false,
     error: `Model "${model}" is not configured for target provider ${formatTargetProviderLabel(target)}. Allowed models: ${providerConfig.models.join(', ')}.`
   };
+}
+
+function resolveProviderQualifiedModelForTarget(
+  model: string,
+  providerConfig: ProviderConfig
+): string | undefined {
+  const slashIndex = model.indexOf('/');
+  if (slashIndex <= 0 || slashIndex >= model.length - 1) {
+    return undefined;
+  }
+
+  const providerHint = model.slice(0, slashIndex).trim();
+  const targetModel = model.slice(slashIndex + 1).trim();
+  if (!providerHint || !targetModel || !providerSelectorMatchesTarget(providerHint, providerConfig)) {
+    return undefined;
+  }
+
+  return targetModel;
+}
+
+function providerSelectorMatchesTarget(providerHint: string, providerConfig: ProviderConfig): boolean {
+  const normalizedHint = providerHint.trim().toLowerCase();
+  if (!normalizedHint) {
+    return false;
+  }
+
+  return providerConfigSelectorAliases(providerConfig).some((alias) => alias.toLowerCase() === normalizedHint);
+}
+
+function providerConfigSelectorAliases(providerConfig: ProviderConfig): string[] {
+  const aliases = [providerConfig.name.trim()].filter(Boolean);
+  const publicName = providerConfigPublicName(providerConfig);
+  if (publicName && !aliases.some((alias) => alias.toLowerCase() === publicName.toLowerCase())) {
+    aliases.push(publicName);
+  }
+  return aliases;
+}
+
+function providerConfigPublicName(providerConfig: ProviderConfig): string | undefined {
+  const name = providerConfig.name.trim();
+  const providerType = providerConfig.type.trim().toLowerCase();
+  const segments = name.split('::').map((segment) => segment.trim());
+  if (segments.length < 2 || !providerType) {
+    return undefined;
+  }
+
+  for (let index = segments.length - 1; index > 0; index -= 1) {
+    if (segments[index]?.toLowerCase() !== providerType) {
+      continue;
+    }
+    const suffixes = segments.slice(index + 1);
+    if (!suffixes.every(isProviderConfigPublicNameSuffix)) {
+      continue;
+    }
+    const publicName = segments.slice(0, index).join('::').trim();
+    return publicName || undefined;
+  }
+
+  return undefined;
+}
+
+function isProviderConfigPublicNameSuffix(segment: string): boolean {
+  return segment.trim().toLowerCase().startsWith('cred:');
 }
 
 function parseProviderRouteList(

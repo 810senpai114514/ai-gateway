@@ -34,6 +34,22 @@ describe('agent request identity helpers', () => {
     });
   });
 
+  it('reads static API key request identity metadata', () => {
+    const metadata = mergeGatewayRequestIdentityMetadata(undefined, {
+      source: 'static_api_key',
+      billingSubjectKey: 'api_key:abc123',
+      subject: 'abc123',
+      apiKeyId: 'abc123'
+    });
+
+    expect(readGatewayRequestIdentityMetadata(metadata)).toMatchObject({
+      source: 'static_api_key',
+      billingSubjectKey: 'api_key:abc123',
+      subject: 'abc123',
+      apiKeyId: 'abc123'
+    });
+  });
+
   it('finds the latest propagated request identity from session messages', () => {
     const messages = [
       {

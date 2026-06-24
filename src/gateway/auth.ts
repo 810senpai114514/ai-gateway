@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { FastifyRequest, preHandlerHookHandler } from 'fastify';
 import { isInternalIp } from '../shared/ip';
 import type { GatewayAuthConfig, GatewayRequestIdentity } from '../types';
@@ -58,6 +58,10 @@ export function authenticateGatewayRequest(
     return authenticateViaIntrospection(request, config);
   }
 
+  if (config.mode === 'static_api_key') {
+    return Promise.resolve(authenticateViaStaticApiKey(request, config));
+  }
+
   return Promise.resolve(authenticateViaTrustedHeader(request, config));
 }
 
@@ -112,6 +116,62 @@ function authenticateViaTrustedHeader(
   };
 }
 
+function authenticateViaStaticApiKey(
+  request: FastifyRequest,
+  config: GatewayAuthConfig
+): GatewayAuthResult {
+  if (!config.enabled) {
+    return { ok: true };
+  }
+
+  const staticConfig = config.staticApiKeys;
+  if (!staticConfig || staticConfig.keys.length === 0) {
+    return {
+      ok: false,
+      statusCode: 500,
+      error: 'Static API key auth is enabled but no API keys are configured.'
+    };
+  }
+
+  const tokenLookup = resolveAuthToken(
+    request.headers,
+    staticConfig.keyHeader,
+    staticConfig.keyBearerOnly
+  );
+  if (!tokenLookup.token) {
+    if (config.required) {
+      return {
+        ok: false,
+        statusCode: 401,
+        error: tokenLookup.invalidFormat
+          ? 'Invalid auth token format.'
+          : `Missing auth token header: ${staticConfig.keyHeader}`
+      };
+    }
+
+    return { ok: true };
+  }
+
+  if (!matchesAnyStaticApiKey(tokenLookup.token, staticConfig.keys)) {
+    return {
+      ok: false,
+      statusCode: 401,
+      error: 'Invalid API key.'
+    };
+  }
+
+  const apiKeyId = buildStaticApiKeyId(tokenLookup.token);
+  return {
+    ok: true,
+    identity: {
+      source: 'static_api_key',
+      billingSubjectKey: `api_key:${apiKeyId}`,
+      subject: apiKeyId,
+      apiKeyId
+    }
+  };
+}
+
 async function authenticateViaIntrospection(
   request: FastifyRequest,
   config: GatewayAuthConfig
@@ -133,7 +193,11 @@ async function authenticateViaIntrospection(
     };
   }
 
-  const tokenLookup = resolveIntrospectionToken(request.headers, config);
+  const tokenLookup = resolveAuthToken(
+    request.headers,
+    config.introspection.tokenHeader,
+    config.introspection.tokenBearerOnly
+  );
   if (!tokenLookup.token) {
     if (config.required) {
       if (tokenLookup.invalidFormat) {
@@ -458,19 +522,20 @@ function unwrapIntrospectionPayload(payload: unknown): unknown {
   return payload;
 }
 
-function resolveIntrospectionToken(
+function resolveAuthToken(
   headers: FastifyRequest['headers'],
-  config: GatewayAuthConfig
+  primaryHeader: string,
+  bearerOnly: boolean
 ): { token?: string; invalidFormat: boolean } {
   let invalidFormat = false;
 
-  for (const headerName of buildTokenHeaderCandidates(config.introspection.tokenHeader)) {
+  for (const headerName of buildTokenHeaderCandidates(primaryHeader)) {
     const tokenRaw = readHeaderValue(headers, headerName);
     if (!tokenRaw) {
       continue;
     }
 
-    const token = normalizeIntrospectionTokenValue(tokenRaw, headerName, config);
+    const token = normalizeAuthTokenValue(tokenRaw, headerName, primaryHeader, bearerOnly);
     if (token) {
       return { token, invalidFormat };
     }
@@ -504,12 +569,13 @@ function buildTokenHeaderCandidates(primaryHeader: string): string[] {
   return candidates;
 }
 
-function normalizeIntrospectionTokenValue(
+function normalizeAuthTokenValue(
   tokenRaw: string,
   headerName: string,
-  config: GatewayAuthConfig
+  primaryHeader: string,
+  bearerOnly: boolean
 ): string | undefined {
-  const primaryHeader = config.introspection.tokenHeader.toLowerCase();
+  const normalizedPrimaryHeader = primaryHeader.toLowerCase();
 
   if (headerName === 'authorization') {
     const bearerToken = readBearerToken(tokenRaw);
@@ -517,15 +583,15 @@ function normalizeIntrospectionTokenValue(
       return bearerToken;
     }
 
-    if (headerName === primaryHeader && !config.introspection.tokenBearerOnly) {
+    if (headerName === normalizedPrimaryHeader && !bearerOnly) {
       return tokenRaw;
     }
 
     return undefined;
   }
 
-  if (headerName === primaryHeader) {
-    if (!config.introspection.tokenBearerOnly) {
+  if (headerName === normalizedPrimaryHeader) {
+    if (!bearerOnly) {
       return tokenRaw;
     }
 
@@ -533,6 +599,20 @@ function normalizeIntrospectionTokenValue(
   }
 
   return tokenRaw;
+}
+
+function matchesAnyStaticApiKey(token: string, allowedKeys: string[]): boolean {
+  return allowedKeys.some((allowedKey) => timingSafeTokenEqual(token, allowedKey));
+}
+
+function timingSafeTokenEqual(left: string, right: string): boolean {
+  const leftDigest = createHash('sha256').update(left).digest();
+  const rightDigest = createHash('sha256').update(right).digest();
+  return timingSafeEqual(leftDigest, rightDigest);
+}
+
+function buildStaticApiKeyId(token: string): string {
+  return createHash('sha256').update(token).digest('hex').slice(0, 16);
 }
 
 function readStringFromPath(value: unknown, path: string): string | undefined {

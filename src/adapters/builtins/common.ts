@@ -119,7 +119,10 @@ export function mapFinishReasonToOpenAI(reason?: string): string {
 function shouldPreferManagedCredential(
   config: Pick<GatewayConfig, 'auth'>
 ): boolean {
-  return Boolean(config.auth?.enabled && config.auth?.mode === 'http_introspection');
+  return Boolean(
+    config.auth?.enabled &&
+      (config.auth?.mode === 'http_introspection' || config.auth?.mode === 'static_api_key')
+  );
 }
 
 export function mapFinishReasonToAnthropic(reason?: string): string {
@@ -171,6 +174,12 @@ export function normalizeOpenAIResponsesUsage(usageRaw: unknown): Record<string,
     : isPlainRecord(usage.completion_tokens_details)
       ? usage.completion_tokens_details
       : {};
+  const cacheCreationTokens =
+    asTokenCount(inputDetails.cache_creation_tokens) ??
+    asTokenCount(usage.cache_creation_input_tokens) ??
+    asTokenCount(usage.cache_creation_tokens) ??
+    asTokenCount(usage.cache_write_tokens);
+  const serverToolUse = normalizeServerToolUse(usage.server_tool_use);
 
   return {
     input_tokens: inputTokens,
@@ -180,7 +189,8 @@ export function normalizeOpenAIResponsesUsage(usageRaw: unknown): Record<string,
         asTokenCount(inputDetails.cached_tokens) ??
         asTokenCount(usage.cache_read_input_tokens) ??
         asTokenCount(usage.cache_read_tokens) ??
-        0
+        0,
+      ...(cacheCreationTokens !== undefined ? { cache_creation_tokens: cacheCreationTokens } : {})
     },
     output_tokens: outputTokens,
     output_tokens_details: {
@@ -190,7 +200,8 @@ export function normalizeOpenAIResponsesUsage(usageRaw: unknown): Record<string,
         asTokenCount(usage.reasoning_tokens) ??
         0
     },
-    total_tokens: totalTokens
+    total_tokens: totalTokens,
+    ...(serverToolUse ? { server_tool_use: serverToolUse } : {})
   };
 }
 
@@ -227,4 +238,23 @@ function asTokenCount(value: unknown): number | undefined {
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return isObject(value) && !Array.isArray(value);
+}
+
+function normalizeServerToolUse(value: unknown): Record<string, number> | undefined {
+  if (!isPlainRecord(value)) {
+    return undefined;
+  }
+
+  const serverToolUse: Record<string, number> = {};
+  const webSearchRequests = asTokenCount(value.web_search_requests);
+  if (webSearchRequests !== undefined) {
+    serverToolUse.web_search_requests = webSearchRequests;
+  }
+
+  const webFetchRequests = asTokenCount(value.web_fetch_requests);
+  if (webFetchRequests !== undefined) {
+    serverToolUse.web_fetch_requests = webFetchRequests;
+  }
+
+  return Object.keys(serverToolUse).length > 0 ? serverToolUse : undefined;
 }

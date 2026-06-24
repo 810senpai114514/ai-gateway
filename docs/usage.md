@@ -240,13 +240,14 @@ docker compose up --build
 - `providerPlugins` 的 `auth/request/response` 支持声明式规则：`headers`、`query`、`bodySet`、`bodyMerge`、`bodyRemove`
 - `providerPlugins` 支持值引用：`{"from":"env.XXX"}`、`{"from":"request.headers.x-foo"}`、`{"from":"request.body.user.id"}`、`{"from":"upstreamPayload.data.id"}`、`{"from":"target.providerName"}`
 - `providerPlugins.codexOauth` 字段：`accessToken`、`refreshToken`、`tokenEndpoint`、`clientId`、`scope`、`refreshIfMissingAccessToken`、`forceRefresh`、`required`、`timeoutMs`、`authHeader`、`authScheme`
+- `virtualModelProfiles[].execution.streamMode` 默认为 `buffered`；设为 `optimistic` 时，OpenAI Chat Completions 上游 SSE 会边转发 reasoning/text，边拦截 internal tools，并在工具结果回填后继续同一个下游流。该模式仅在没有 client-visible tools 且无 response transform plugin 时启用，否则回退为 buffered。
 - `providerExternal` 用于通过 HTTP/WebSocket/gRPC/stdio 从外部服务动态加载 provider、providerPlugins 与 virtualModelProfiles。
 - `billing` 支持 `cacheReadPerMillionUsd` / `cacheWritePerMillionUsd` 与 `tiers`（阶梯计费）
 - `configExternal` 用于从外部服务动态获取完整 gateway 配置（`enabled`、`transport=http|websocket|grpc|stdio`、`endpoint`、`command`、`args`、`cwd`、`env`、`method`、`timeoutMs`、`intervalMs|intervalSeconds`、`apiKeyHeader`、`apiKey|apiKeyEnv`、`headers`）；外部返回体可为完整配置对象、`{"config": {...}}` 或 `{"gatewayConfig": {...}}`。gRPC 使用 JSON unary，默认 path 为 `/gateway.config.v1.ConfigService/GetConfig`。
 - `billingWebhook` 用于配置事件上报（`enabled`、`transport=http|websocket|grpc|stdio`、`endpoint`、`command`、`args`、`cwd`、`env`、`timeoutMs`、`maxAttempts`、`baseDelayMs`、`maxDelayMs`、`requireAck`、`headers`）；gRPC 使用 JSON unary，默认 path 为 `/gateway.events.v1.EventSink/Publish`。
 - `billingQueue` 为历史兼容字段；gateway 不会创建队列连接，开启后也只记录禁用日志。需要队列时请通过 `billingWebhook` 或外部协议适配服务实现。
 - `rawTrace` 用于捕获原始请求/上游链路包；gateway 只写本地 spool bundle，`rawTrace.sync` 通过 HTTP/WebSocket/gRPC/stdio 上报 manifest，支持失败重试，由外部服务负责持久化、索引和归档。
-- `auth` 用于配置客户侧鉴权（`enabled`、`mode`、`required`、`trustedCidrs`、`identityHeaders`、`signature`、`introspection`）
+- `auth` 用于配置客户侧鉴权（`enabled`、`mode`、`required`、`trustedCidrs`、`identityHeaders`、`signature`、`introspection`、`staticApiKeys`）
 - `precheck` 用于请求前治理（`rateLimit`、`quota`、`budget`、`estimation`），`precheck.storage.type` 仅使用进程内 `memory`。多实例全局限流/预算应由外部治理服务提供。
 - `providerHealthCheck` 用于配置定时 provider 探测（默认关闭）：`enabled`、`intervalMs|intervalSeconds`、`timeoutMs|timeoutSeconds`、`initialDelayMs|initialDelaySeconds`。
 - `metrics` 用于配置 Prometheus 指标导出（默认关闭）：`enabled`、`includeProviderHealth`；开启后可访问 `GET /metrics`。
@@ -329,10 +330,10 @@ docker compose up --build
 - `DEFAULT_TARGET_PROVIDERS`：默认目标 provider 列表（逗号分隔，如 `openai,anthropic,gemini`）
 - `UPSTREAM_TIMEOUT_MS`：兼容旧配置字段；当前不再对模型上游请求设置网关侧固定超时
 
-### 客户 Auth（Header / Introspection）
+### 客户 Auth（Header / Introspection / Static API Key）
 
 - `AUTH_ENABLED`：是否开启客户身份鉴权，默认 `false`
-- `AUTH_MODE`：鉴权模式，`trusted_header|http_introspection`（默认 `trusted_header`）
+- `AUTH_MODE`：鉴权模式，`trusted_header|http_introspection|static_api_key`（默认 `trusted_header`）
 - `AUTH_REQUIRED`：是否强制要求身份头，默认 `true`
 - `AUTH_TRUSTED_CIDRS`：允许注入身份头的来源网段（逗号分隔，可选）
 - `AUTH_HEADER_USER_ID`：用户 ID 头名，默认 `x-auth-user-id`
@@ -347,6 +348,14 @@ docker compose up --build
 - `AUTH_SIGNATURE_SECRET_ENV`：签名密钥对应的环境变量名，默认 `AUTH_HEADER_SIGNING_SECRET`
 - `AUTH_SIGNATURE_MAX_SKEW_SEC`：签名允许的最大时间偏移秒数，默认 `120`
 - `AUTH_HEADER_SIGNING_SECRET`：签名密钥（当 `AUTH_SIGNATURE_ENABLED=true` 时必填）
+
+`static_api_key` 模式（网关本地校验固定 API key）：
+
+- `AUTH_STATIC_API_KEYS`：允许的客户端 API key，逗号分隔
+- `AUTH_STATIC_API_KEY`：允许的单个客户端 API key，也可写成逗号分隔
+- `AUTH_STATIC_API_KEY_ENV` / `AUTH_STATIC_API_KEYS_ENV`：从指定环境变量读取允许 key 列表
+- `AUTH_STATIC_API_KEY_HEADER`：从入站请求读取 key 的 Header（默认 `authorization`）
+- `AUTH_STATIC_API_KEY_BEARER_ONLY`：当读取 `authorization` 时是否要求 `Bearer <token>` 格式（默认 `true`）
 
 `http_introspection` 模式（网关主动调用客户 Auth 服务）：
 

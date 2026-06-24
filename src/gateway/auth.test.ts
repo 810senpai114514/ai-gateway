@@ -49,10 +49,9 @@ describe('gateway auth', () => {
   afterEach(() => {
     if (originalSecret === undefined) {
       delete process.env.AUTH_HEADER_SIGNING_SECRET;
-      return;
+    } else {
+      process.env.AUTH_HEADER_SIGNING_SECRET = originalSecret;
     }
-
-    process.env.AUTH_HEADER_SIGNING_SECRET = originalSecret;
 
     if (originalIntrospectionSecret === undefined) {
       delete process.env.AUTH_INTROSPECTION_SHARED_SECRET;
@@ -101,6 +100,70 @@ describe('gateway auth', () => {
     expect(result.identity?.userId).toBe('user-1');
     expect(result.identity?.tenantId).toBe('tenant-a');
     expect(result.identity?.source).toBe('trusted_header');
+  });
+
+  it('authenticates static API keys from authorization bearer tokens', async () => {
+    const request = createRequest({
+      authorization: 'Bearer gateway-key-1'
+    });
+    const result = await authenticateGatewayRequest(request, {
+      ...baseConfig,
+      mode: 'static_api_key',
+      staticApiKeys: {
+        keys: ['gateway-key-1', 'gateway-key-2'],
+        keyHeader: 'authorization',
+        keyBearerOnly: true
+      }
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.identity?.source).toBe('static_api_key');
+    expect(result.identity?.apiKeyId).toMatch(/^[a-f0-9]{16}$/);
+    expect(result.identity?.billingSubjectKey).toBe(`api_key:${result.identity?.apiKeyId}`);
+  });
+
+  it('rejects invalid static API keys', async () => {
+    const request = createRequest({
+      authorization: 'Bearer wrong-key'
+    });
+    const result = await authenticateGatewayRequest(request, {
+      ...baseConfig,
+      mode: 'static_api_key',
+      staticApiKeys: {
+        keys: ['gateway-key-1'],
+        keyHeader: 'authorization',
+        keyBearerOnly: true
+      }
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+
+    expect(result.statusCode).toBe(401);
+    expect(result.error).toBe('Invalid API key.');
+  });
+
+  it('supports static API keys from x-api-key headers', async () => {
+    const request = createRequest({
+      'x-api-key': 'gateway-key-1'
+    });
+    const result = await authenticateGatewayRequest(request, {
+      ...baseConfig,
+      mode: 'static_api_key',
+      staticApiKeys: {
+        keys: ['gateway-key-1'],
+        keyHeader: 'x-api-key',
+        keyBearerOnly: false
+      }
+    });
+
+    expect(result.ok).toBe(true);
   });
 
   it('rejects requests from untrusted cidr when trusted list is configured', async () => {

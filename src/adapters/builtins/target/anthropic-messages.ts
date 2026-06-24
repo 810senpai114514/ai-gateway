@@ -3,14 +3,24 @@ import { ok } from '../../../types';
 import { asString, collectStandardInputMessages, isObject } from '../../../utils';
 import { buildAnthropicHeaders } from '../common';
 import { parseAnthropicToStandardResponse } from './shared';
-import { flattenStandardTools, mapStandardToolNameToTargetName, mapToolChoiceFunctionName } from './tools';
+import {
+  anthropicWebSearchToolType,
+  flattenStandardTools,
+  isAnthropicWebSearchTool,
+  isOpenAIWebSearchTool,
+  mapStandardToolNameToTargetName,
+  mapToolChoiceFunctionName
+} from './tools';
 
 const defaultAnthropicMaxTokens = 1024;
 
 export const anthropicMessagesTargetAdapter: TargetAdapter = {
   provider: 'anthropic',
   buildRequestFromStandard(input) {
-    const headersResult = buildAnthropicHeaders(input.request.headers, input.config);
+    const headersResult = buildAnthropicHeaders(input.request.headers, {
+      ...input.config,
+      anthropicApiKey: input.targetProviderConfig?.apikey || input.config.anthropicApiKey
+    });
     if (!headersResult.ok) {
       return headersResult;
     }
@@ -228,18 +238,94 @@ function anthropicBlocksFromReasoningDetails(value: unknown[] | undefined): Arra
 }
 
 function mapStandardToolsToAnthropicTools(tools: unknown[] | undefined): Record<string, unknown>[] | undefined {
-  const mapped = flattenStandardTools(tools).map((tool) => {
-    const mappedTool: Record<string, unknown> = {
-      name: tool.targetName,
-      input_schema: tool.parameters
-    };
-    if (tool.description) {
-      mappedTool.description = tool.description;
+  const mapped: Record<string, unknown>[] = [];
+  for (const tool of tools || []) {
+    const webSearchTool = mapStandardWebSearchToolToAnthropicTool(tool);
+    if (webSearchTool) {
+      mapped.push(webSearchTool);
+      continue;
     }
 
-    return mappedTool;
-  });
+    for (const flattenedTool of flattenStandardTools([tool])) {
+      const mappedTool: Record<string, unknown> = {
+        name: flattenedTool.targetName,
+        input_schema: flattenedTool.parameters
+      };
+      if (flattenedTool.description) {
+        mappedTool.description = flattenedTool.description;
+      }
+
+      mapped.push(mappedTool);
+    }
+  }
   return mapped.length > 0 ? mapped : undefined;
+}
+
+function mapStandardWebSearchToolToAnthropicTool(tool: unknown): Record<string, unknown> | null {
+  if (!isObject(tool)) {
+    return null;
+  }
+
+  if (isAnthropicWebSearchTool(tool)) {
+    const mapped: Record<string, unknown> = {
+      type: asString(tool.type) || anthropicWebSearchToolType,
+      name: asString(tool.name) || 'web_search'
+    };
+    copyDefinedToolFields(tool, mapped, [
+      'max_uses',
+      'allowed_domains',
+      'blocked_domains',
+      'user_location',
+      'cache_control'
+    ]);
+    return mapped;
+  }
+
+  if (!isOpenAIWebSearchTool(tool)) {
+    return null;
+  }
+
+  const mapped: Record<string, unknown> = {
+    type: anthropicWebSearchToolType,
+    name: 'web_search'
+  };
+  const filters = isObject(tool.filters) ? tool.filters : undefined;
+  const allowedDomains = readStringArray(filters?.allowed_domains);
+  const blockedDomains = readStringArray(filters?.blocked_domains);
+  if (allowedDomains) {
+    mapped.allowed_domains = allowedDomains;
+  }
+  if (blockedDomains) {
+    mapped.blocked_domains = blockedDomains;
+  }
+  if (tool.user_location !== undefined) {
+    mapped.user_location = tool.user_location;
+  }
+
+  return mapped;
+}
+
+function copyDefinedToolFields(
+  source: Record<string, unknown>,
+  target: Record<string, unknown>,
+  keys: string[]
+): void {
+  for (const key of keys) {
+    if (source[key] !== undefined) {
+      target[key] = source[key];
+    }
+  }
+}
+
+function readStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const values = value
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter(Boolean);
+  return values.length > 0 ? values : undefined;
 }
 
 function mapStandardToolChoiceToAnthropicToolChoice(

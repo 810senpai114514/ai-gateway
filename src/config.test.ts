@@ -59,6 +59,14 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_ALLOW_TOOLS;
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_DENY_TOOLS;
     delete process.env.TEST_PROVIDER_API_KEY;
+    delete process.env.AUTH_MODE;
+    delete process.env.AUTH_STATIC_API_KEY;
+    delete process.env.AUTH_STATIC_API_KEYS;
+    delete process.env.AUTH_STATIC_API_KEY_ENV;
+    delete process.env.AUTH_STATIC_API_KEYS_ENV;
+    delete process.env.AUTH_STATIC_API_KEY_HEADER;
+    delete process.env.AUTH_STATIC_API_KEY_BEARER_ONLY;
+    delete process.env.TEST_GATEWAY_API_KEYS;
     delete process.env.GATEWAY_CONFIG_EXTERNAL_ENABLED;
     delete process.env.GATEWAY_CONFIG_EXTERNAL_TRANSPORT;
     delete process.env.GATEWAY_CONFIG_EXTERNAL_ENDPOINT;
@@ -150,6 +158,47 @@ describe('Gateway config providerPlugins', () => {
       name: 'openai-env',
       apikey: 'provider-env-secret',
       apiKeyEnv: 'TEST_PROVIDER_API_KEY'
+    });
+  });
+
+  it('parses OpenAI chat tools format compatibility config', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'r9s-openai',
+          type: 'openai_chat_completions',
+          openaiChatToolsFormat: 'anthropic',
+          models: ['glm-5.1']
+        }
+      ]
+    });
+
+    expect(config.providers[0]?.openaiChatToolsFormat).toBe('anthropic');
+  });
+
+  it('parses static API key auth config from file and environment', () => {
+    process.env.AUTH_MODE = 'static-api-key';
+    process.env.AUTH_STATIC_API_KEYS = 'env-key-1,env-key-2';
+    process.env.TEST_GATEWAY_API_KEYS = 'ref-key-1,ref-key-2';
+
+    const config = parseGatewayConfigFromRaw({
+      auth: {
+        enabled: true,
+        staticApiKeys: {
+          keys: ['file-key'],
+          keyEnv: 'TEST_GATEWAY_API_KEYS',
+          keyHeader: 'x-api-key',
+          keyBearerOnly: false
+        }
+      }
+    });
+
+    expect(config.auth.mode).toBe('static_api_key');
+    expect(config.auth.staticApiKeys).toMatchObject({
+      keys: ['env-key-1', 'env-key-2', 'ref-key-1', 'ref-key-2', 'file-key'],
+      keyEnv: 'TEST_GATEWAY_API_KEYS',
+      keyHeader: 'x-api-key',
+      keyBearerOnly: false
     });
   });
 
@@ -1068,5 +1117,53 @@ describe('Gateway config providerPlugins', () => {
     expect(config.policy.byPlan.free).toMatchObject({
       denyModels: ['gpt-expensive']
     });
+  });
+
+  it('parses virtual model optimistic stream mode', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'openai-main',
+          type: 'openai_chat_completions',
+          apikey: 'provider-api-key',
+          models: ['glm-5']
+        }
+      ],
+      virtualModelProfiles: [
+        {
+          id: 'websearch',
+          key: 'websearch',
+          displayName: 'Web Search',
+          match: {
+            suffixes: [':websearch']
+          },
+          tools: [
+            {
+              name: 'web_search',
+              visibility: 'internal'
+            }
+          ],
+          execution: {
+            mode: 'tool_loop',
+            streamMode: 'optimistic'
+          }
+        },
+        {
+          id: 'buffered',
+          key: 'buffered',
+          displayName: 'Buffered',
+          match: {
+            suffixes: [':buffered']
+          },
+          tools: [],
+          execution: {
+            mode: 'tool_loop'
+          }
+        }
+      ]
+    });
+
+    expect(config.virtualModelProfiles?.[0]?.execution.streamMode).toBe('optimistic');
+    expect(config.virtualModelProfiles?.[1]?.execution.streamMode).toBe('buffered');
   });
 });

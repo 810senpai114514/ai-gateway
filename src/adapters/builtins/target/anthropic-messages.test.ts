@@ -376,4 +376,187 @@ describe('anthropicMessagesTargetAdapter', () => {
       }
     ]);
   });
+
+  it('does not add web search tools when the client did not declare one', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.4',
+      input: 'What happened today?'
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body).not.toHaveProperty('tools');
+  });
+
+  it('maps explicit OpenAI Responses web_search tools to Anthropic server tools', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.4',
+      input: 'What happened today?',
+      tools: [
+        {
+          type: 'web_search',
+          filters: {
+            allowed_domains: ['openai.com'],
+            blocked_domains: ['example.com']
+          }
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.tools).toEqual([
+      {
+        type: 'web_search_20250305',
+        name: 'web_search',
+        allowed_domains: ['openai.com'],
+        blocked_domains: ['example.com']
+      }
+    ]);
+  });
+
+  it('preserves explicit Anthropic web_search server tools', () => {
+    const parsed = parseOpenAIResponsesRequest({
+      model: 'gpt-5.4',
+      input: 'What happened today?',
+      tools: [
+        {
+          type: 'web_search_20250305',
+          name: 'web_search',
+          max_uses: 3,
+          allowed_domains: ['docs.anthropic.com']
+        }
+      ]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.tools).toEqual([
+      {
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: 3,
+        allowed_domains: ['docs.anthropic.com']
+      }
+    ]);
+  });
+
+  it('keeps a custom function named web_search as a client tool', () => {
+    const parsed = parseOpenAIChatCompletionsRequest({
+      model: 'glm-5',
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'web_search',
+            description: 'Custom search function.',
+            parameters: {
+              type: 'object',
+              properties: {
+                query: { type: 'string' }
+              },
+              required: ['query']
+            }
+          }
+        }
+      ],
+      messages: [{ role: 'user', content: 'Use my custom search function' }]
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+
+    const built = anthropicMessagesTargetAdapter.buildRequestFromStandard({
+      request: {
+        headers: {}
+      } as never,
+      standardRequest: parsed.value,
+      config: {
+        anthropicApiKey: 'sk-test',
+        anthropicBaseUrl: 'https://mock.local'
+      } as never
+    });
+
+    expect(built.ok).toBe(true);
+    if (!built.ok) {
+      return;
+    }
+
+    const body = built.value.body as Record<string, unknown>;
+    expect(body.tools).toEqual([
+      {
+        name: 'web_search',
+        description: 'Custom search function.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' }
+          },
+          required: ['query']
+        }
+      }
+    ]);
+  });
 });

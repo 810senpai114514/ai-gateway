@@ -11,6 +11,8 @@ import { asString, collectStandardInputMessages, isObject } from '../../../utils
 import { buildOpenAIHeaders } from '../common';
 import { parseOpenAIToStandardResponse } from './shared';
 import {
+  isAnthropicWebSearchTool,
+  isOpenAIWebSearchTool,
   ensureJsonSchema,
   flattenStandardTools,
   mapStandardToolNameToTargetName,
@@ -22,7 +24,10 @@ import {
 export const openAIResponsesTargetAdapter: TargetAdapter = {
   provider: 'openai',
   buildRequestFromStandard(input) {
-    const headersResult = buildOpenAIHeaders(input.request.headers, input.config);
+    const headersResult = buildOpenAIHeaders(input.request.headers, {
+      ...input.config,
+      openaiApiKey: input.targetProviderConfig?.apikey || input.config.openaiApiKey
+    });
     if (!headersResult.ok) {
       return headersResult;
     }
@@ -43,7 +48,10 @@ export const openAIResponsesTargetAdapter: TargetAdapter = {
         stop: input.standardRequest.stop
       };
 
-      const tools = mapStandardToolsToOpenAIChatTools(input.standardRequest.tools);
+      const tools = mapStandardToolsToOpenAIChatTools(
+        input.standardRequest.tools,
+        input.targetProviderConfig?.openaiChatToolsFormat
+      );
       if (tools) {
         body.tools = tools;
       }
@@ -459,8 +467,22 @@ function normalizeWebSearchAction(content: string): Record<string, unknown> {
   return { type: 'search', queries: [] };
 }
 
-function mapStandardToolsToOpenAIChatTools(tools: unknown[] | undefined): Record<string, unknown>[] | undefined {
+function mapStandardToolsToOpenAIChatTools(
+  tools: unknown[] | undefined,
+  format: ProviderConfig['openaiChatToolsFormat'] = 'openai'
+): Record<string, unknown>[] | undefined {
   const mapped = flattenStandardTools(tools).map((tool) => {
+    if (format === 'anthropic') {
+      const mappedTool: Record<string, unknown> = {
+        name: tool.targetName,
+        input_schema: tool.parameters
+      };
+      if (tool.description) {
+        mappedTool.description = tool.description;
+      }
+      return mappedTool;
+    }
+
     const functionObject: Record<string, unknown> = {
       name: tool.targetName,
       parameters: tool.parameters
@@ -496,6 +518,14 @@ function mapStandardToolToOpenAIResponsesTool(tool: unknown): Record<string, unk
     return null;
   }
 
+  if (isOpenAIWebSearchTool(tool)) {
+    return mapOpenAIWebSearchToolToOpenAIResponsesTool(tool);
+  }
+
+  if (isAnthropicWebSearchTool(tool)) {
+    return mapAnthropicWebSearchToolToOpenAIResponsesTool(tool);
+  }
+
   if (asString(tool.type) === 'namespace') {
     return mapStandardNamespaceToolToOpenAIResponsesTool(tool);
   }
@@ -523,6 +553,80 @@ function mapStandardToolToOpenAIResponsesTool(tool: unknown): Record<string, unk
   }
 
   return mapped;
+}
+
+function mapOpenAIWebSearchToolToOpenAIResponsesTool(
+  tool: Record<string, unknown>
+): Record<string, unknown> | null {
+  const type = asString(tool.type);
+  if (type !== 'web_search' && type !== 'web_search_preview') {
+    return null;
+  }
+
+  const mapped: Record<string, unknown> = { type };
+  copyDefinedToolFields(tool, mapped, [
+    'search_context_size',
+    'user_location',
+    'filters',
+    'external_web_access',
+    'return_token_budget',
+    'search_content_types',
+    'image_settings'
+  ]);
+  return mapped;
+}
+
+function mapAnthropicWebSearchToolToOpenAIResponsesTool(
+  tool: Record<string, unknown>
+): Record<string, unknown> {
+  const mapped: Record<string, unknown> = {
+    type: 'web_search'
+  };
+  const filters = mapAnthropicWebSearchFiltersToOpenAI(tool);
+  if (filters) {
+    mapped.filters = filters;
+  }
+  return mapped;
+}
+
+function mapAnthropicWebSearchFiltersToOpenAI(
+  tool: Record<string, unknown>
+): Record<string, unknown> | undefined {
+  const filters: Record<string, unknown> = {};
+  const allowedDomains = readStringArray(tool.allowed_domains);
+  const blockedDomains = readStringArray(tool.blocked_domains);
+
+  if (allowedDomains) {
+    filters.allowed_domains = allowedDomains;
+  }
+  if (blockedDomains) {
+    filters.blocked_domains = blockedDomains;
+  }
+
+  return Object.keys(filters).length > 0 ? filters : undefined;
+}
+
+function copyDefinedToolFields(
+  source: Record<string, unknown>,
+  target: Record<string, unknown>,
+  keys: string[]
+): void {
+  for (const key of keys) {
+    if (source[key] !== undefined) {
+      target[key] = source[key];
+    }
+  }
+}
+
+function readStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const values = value
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter(Boolean);
+  return values.length > 0 ? values : undefined;
 }
 
 function mapStandardNamespaceToolToOpenAIResponsesTool(tool: Record<string, unknown>): Record<string, unknown> | null {

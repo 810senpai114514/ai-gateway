@@ -3,6 +3,7 @@ import type { StandardResponse, StandardResponseFunctionCall } from '../../../ty
 import { asBoolean, asString, isObject } from '../../../utils';
 
 const maxTargetToolNameLength = 64;
+export const anthropicWebSearchToolType = 'web_search_20250305';
 
 export interface FlattenedStandardTool {
   name: string;
@@ -157,6 +158,28 @@ export function normalizeNamespacedToolName(
   return `${trimmedNamespace}.${trimmedName}`;
 }
 
+export function isOpenAIWebSearchTool(tool: unknown): tool is Record<string, unknown> {
+  if (!isObject(tool)) {
+    return false;
+  }
+
+  const type = asString(tool.type);
+  return type === 'web_search' || type === 'web_search_preview';
+}
+
+export function isAnthropicWebSearchTool(tool: unknown): tool is Record<string, unknown> {
+  if (!isObject(tool)) {
+    return false;
+  }
+
+  const type = asString(tool.type);
+  return Boolean(type && /^web_search_\d{8}$/.test(type));
+}
+
+export function isHostedWebSearchTool(tool: unknown): boolean {
+  return isOpenAIWebSearchTool(tool) || isAnthropicWebSearchTool(tool);
+}
+
 export function normalizeTargetToolName(name: string): string {
   const fallback = 'tool';
   const sanitized = name
@@ -208,6 +231,10 @@ function normalizeUniqueTargetToolName(name: string, used: Set<string>): string 
 
 function flattenStandardTool(tool: unknown): Array<Omit<FlattenedStandardTool, 'targetName'>> {
   if (!isObject(tool)) {
+    return [];
+  }
+
+  if (isHostedWebSearchTool(tool)) {
     return [];
   }
 

@@ -85,5 +85,7 @@ function readOptionalString(value: unknown): string | undefined {
 }
 
 function readIdentitySource(value: unknown): GatewayRequestIdentity['source'] | undefined {
-  return value === 'trusted_header' || value === 'http_introspection' ? value : undefined;
+  return value === 'trusted_header' || value === 'http_introspection' || value === 'static_api_key'
+    ? value
+    : undefined;
 }

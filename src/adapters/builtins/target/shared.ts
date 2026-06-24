@@ -61,8 +61,9 @@ export function parseAnthropicToStandardResponse(payload: unknown): Result<Stand
 
   const text = extractAnthropicText(payload.content);
   const toolCalls = extractAnthropicFunctionCalls(payload.content);
-  if (!text && toolCalls.length === 0) {
-    return err('Anthropic response does not contain text output or tool calls.');
+  const reasoningItems = extractAnthropicReasoningItems(payload.content);
+  if (!text && toolCalls.length === 0 && reasoningItems.length === 0) {
+    return err('Anthropic response does not contain text output, reasoning output, or tool calls.');
   }
 
   const usageRaw = isObject(payload.usage) ? payload.usage : undefined;
@@ -86,7 +87,7 @@ export function parseAnthropicToStandardResponse(payload: unknown): Result<Stand
     id: asString(payload.id) || `msg_${randomUUID()}`,
     model: asString(payload.model) || 'unknown',
     outputText: text,
-    outputItems: buildStandardResponseOutputItems(text, toolCalls),
+    outputItems: buildStandardResponseOutputItems(text, toolCalls, reasoningItems),
     usage,
     finishReason: asString(payload.stop_reason)
   }));
@@ -637,6 +638,77 @@ function extractAnthropicFunctionCalls(content: unknown): StandardResponseFuncti
   }
 
   return toolCalls;
+}
+
+function extractAnthropicReasoningItems(content: unknown): StandardResponseReasoning[] {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
+  const reasoningDetails: unknown[] = [];
+  let encryptedContent: string | undefined;
+
+  for (const block of content) {
+    if (!isObject(block)) {
+      continue;
+    }
+
+    const type = asString(block.type);
+    if (type === 'thinking') {
+      const thinking = asString(block.thinking);
+      if (!thinking) {
+        continue;
+      }
+
+      reasoningContent.push({
+        type: 'reasoning_text',
+        text: thinking
+      });
+      reasoningDetails.push({
+        type: 'thinking',
+        thinking,
+        ...(asString(block.signature) ? { signature: asString(block.signature) } : {})
+      });
+      continue;
+    }
+
+    if (type === 'redacted_thinking') {
+      const data = asString(block.data);
+      if (!data) {
+        continue;
+      }
+
+      encryptedContent = encryptedContent || data;
+      reasoningDetails.push({
+        type: 'redacted_thinking',
+        data
+      });
+    }
+  }
+
+  if (reasoningContent.length === 0 && !encryptedContent && reasoningDetails.length === 0) {
+    return [];
+  }
+
+  const reasoning: StandardResponseReasoning = {
+    id: `rs_${randomUUID().replace(/-/g, '')}`,
+    type: 'reasoning',
+    status: 'completed',
+    summary: []
+  };
+
+  if (reasoningContent.length > 0) {
+    reasoning.content = reasoningContent;
+  }
+  if (encryptedContent) {
+    reasoning.encrypted_content = encryptedContent;
+  }
+  if (reasoningDetails.length > 0) {
+    reasoning.reasoning_details = reasoningDetails;
+  }
+
+  return [reasoning];
 }
 
 function normalizeFunctionCallArguments(value: unknown): string {

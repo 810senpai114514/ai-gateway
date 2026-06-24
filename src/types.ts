@@ -59,6 +59,7 @@ export interface ProviderConfig {
   apiKeyEnv?: string;
   baseurl?: string;
   models: string[];
+  openaiChatToolsFormat?: 'openai' | 'anthropic';
   extraHeaders: ModelScopedHeadersConfig;
   extraBody: ModelScopedBodyConfig;
   billing: ModelScopedBillingConfig;
@@ -210,7 +211,14 @@ export interface GatewayAuthSignatureConfig {
   maxSkewSec: number;
 }
 
-export type GatewayAuthMode = 'trusted_header' | 'http_introspection';
+export type GatewayAuthMode = 'trusted_header' | 'http_introspection' | 'static_api_key';
+
+export interface GatewayAuthStaticApiKeysConfig {
+  keys: string[];
+  keyEnv?: string;
+  keyHeader: string;
+  keyBearerOnly: boolean;
+}
 
 export interface GatewayAuthIntrospectionResponseMapConfig {
   active: string;
@@ -241,6 +249,7 @@ export interface GatewayAuthConfig {
   identityHeaders: GatewayAuthIdentityHeadersConfig;
   signature: GatewayAuthSignatureConfig;
   introspection: GatewayAuthIntrospectionConfig;
+  staticApiKeys?: GatewayAuthStaticApiKeysConfig;
 }
 
 export interface GatewayRequestIdentity {
@@ -599,7 +608,7 @@ export interface VirtualModelExecutionConfig {
   clientToolsPolicy: 'allow' | 'deny';
   matchMultimodal?: boolean;
   matchWebSearch?: boolean;
-  streamMode: 'buffered';
+  streamMode: 'buffered' | 'optimistic';
 }
 
 export interface VirtualModelMaterializationConfig {

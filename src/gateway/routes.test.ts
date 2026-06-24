@@ -2569,6 +2569,134 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('accepts public provider model selectors for protocol-qualified provider names', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_public_selector_1',
+          model: 'glm-5.2',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'ok'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([
+      createProviderConfig('Zhipu AI (China) - Coding Plan::openai_chat_completions', 'openai_chat_completions', ['glm-5.2']),
+      createProviderConfig('Zhipu AI (China) - Coding Plan::anthropic_messages', 'anthropic_messages', ['glm-5.2'])
+    ]);
+    config.defaultTargetProviders = ['openai', 'anthropic'];
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'Zhipu AI (China) - Coding Plan/glm-5.2',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.model).toBe('glm-5.2');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('accepts public provider model selectors for credential-qualified provider names', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_credential_selector_1',
+          model: 'glm-5.2',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'ok'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 2,
+            completion_tokens: 1,
+            total_tokens: 3
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([
+      createProviderConfig('Zhipu AI (China) - Coding Plan::openai_chat_completions::cred:test-1', 'openai_chat_completions', ['glm-5.2']),
+      createProviderConfig('Zhipu AI (China) - Coding Plan::anthropic_messages::cred:test-1', 'anthropic_messages', ['glm-5.2'])
+    ]);
+    config.defaultTargetProviders = ['openai', 'anthropic'];
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'Zhipu AI (China) - Coding Plan/glm-5.2',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.model).toBe('glm-5.2');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('maps Anthropic thinking controls to DeepSeek OpenAI chat fields', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(
@@ -4448,6 +4576,863 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('does not inject virtual MCP web search tools unless the client declares web search', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_virtual_websearch_none_1',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'answer without search'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 5,
+            completion_tokens: 4,
+            total_tokens: 9
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'virtual-websearch',
+          key: 'websearch',
+          displayName: 'Web Search',
+          enabled: true,
+          match: {
+            exactAliases: [],
+            prefixes: [],
+            suffixes: [':websearch']
+          },
+          baseModel: {
+            mode: 'strip_suffix'
+          },
+          tools: [
+            {
+              name: 'web_search',
+              visibility: 'internal'
+            }
+          ],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'deny',
+            matchWebSearch: true,
+            streamMode: 'buffered'
+          },
+          materialization: {
+            enabled: true,
+            includeInGatewayModels: true
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'openai-main/glm-5:websearch',
+          messages: [{ role: 'user', content: 'What happened today?' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const [, firstInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const firstBody = JSON.parse(String(firstInit.body));
+      expect(firstBody.model).toBe('glm-5');
+      expect(firstBody.tools).toBeUndefined();
+      expect(firstBody.tool_choice).toBeUndefined();
+
+      const payload = JSON.parse(response.body);
+      expect(payload.choices[0]?.message?.content).toBe('answer without search');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('uses explicit Responses web_search declarations to enable virtual MCP web search', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'chatcmpl_virtual_websearch_declared_1',
+            model: 'glm-5',
+            choices: [
+              {
+                index: 0,
+                finish_reason: 'tool_calls',
+                message: {
+                  role: 'assistant',
+                  content: '',
+                  tool_calls: [
+                    {
+                      id: 'call_web_search_1',
+                      type: 'function',
+                      function: {
+                        name: 'web_search',
+                        arguments: '{"query":"latest ai news"}'
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            usage: {
+              prompt_tokens: 5,
+              completion_tokens: 3,
+              total_tokens: 8
+            }
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json'
+            }
+          }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'chatcmpl_virtual_websearch_final_1',
+            model: 'glm-5',
+            choices: [
+              {
+                index: 0,
+                finish_reason: 'stop',
+                message: {
+                  role: 'assistant',
+                  content: 'fresh answer'
+                }
+              }
+            ],
+            usage: {
+              prompt_tokens: 6,
+              completion_tokens: 4,
+              total_tokens: 10
+            }
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json'
+            }
+          }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executedToolCalls: Array<{ name: string; args: unknown }> = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        {
+          name: 'web_search',
+          description: 'Search the web',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      ],
+      has: async () => true,
+      execute: async (name: string, input: { args: unknown }) => {
+        executedToolCalls.push({ name, args: input.args });
+        return {
+          hits: ['fresh result']
+        };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'virtual-websearch-declared',
+          key: 'websearch',
+          displayName: 'Web Search',
+          enabled: true,
+          match: {
+            exactAliases: [],
+            prefixes: [],
+            suffixes: [':websearch']
+          },
+          baseModel: {
+            mode: 'strip_suffix'
+          },
+          tools: [
+            {
+              name: 'web_search',
+              visibility: 'internal'
+            }
+          ],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'deny',
+            matchWebSearch: true,
+            streamMode: 'buffered'
+          },
+          materialization: {
+            enabled: true,
+            includeInGatewayModels: true
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'openai-main/glm-5:websearch',
+          input: 'What happened today?',
+          tools: [
+            {
+              type: 'web_search'
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(executedToolCalls).toEqual([
+        {
+          name: 'web_search',
+          args: {
+            query: 'latest ai news'
+          }
+        }
+      ]);
+
+      const [, firstInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const firstBody = JSON.parse(String(firstInit.body));
+      expect(firstBody.model).toBe('glm-5');
+      expect(firstBody.tools).toHaveLength(1);
+      expect(firstBody.tools?.[0]?.function?.name).toBe('web_search');
+
+      const payload = JSON.parse(response.body);
+      expect(payload.object).toBe('response');
+      expect(payload.output_text).toBe('fresh answer');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('preserves upstream stream requests while running virtual MCP web search tool loops', async () => {
+    const firstStream = [
+      'data: {"id":"chatcmpl_virtual_websearch_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_web_search_stream_1","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"latest ai news\\"}"}}]}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const secondStream = [
+      'data: {"id":"chatcmpl_virtual_websearch_stream_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_stream_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"fresh stream answer"}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_stream_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(firstStream, {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream'
+          }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(secondStream, {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream'
+          }
+        })
+      );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executedToolCalls: Array<{ name: string; args: unknown }> = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        {
+          name: 'web_search',
+          description: 'Search the web',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      ],
+      has: async () => true,
+      execute: async (name: string, input: { args: unknown }) => {
+        executedToolCalls.push({ name, args: input.args });
+        return {
+          hits: ['fresh result']
+        };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'virtual-websearch-stream-declared',
+          key: 'websearch',
+          displayName: 'Web Search',
+          enabled: true,
+          match: {
+            exactAliases: [],
+            prefixes: [],
+            suffixes: [':websearch']
+          },
+          baseModel: {
+            mode: 'strip_suffix'
+          },
+          tools: [
+            {
+              name: 'web_search',
+              visibility: 'internal'
+            }
+          ],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'deny',
+            matchWebSearch: true,
+            streamMode: 'buffered'
+          },
+          materialization: {
+            enabled: true,
+            includeInGatewayModels: true
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'openai-main/glm-5:websearch',
+          input: 'What happened today?',
+          stream: true,
+          tools: [
+            {
+              type: 'web_search'
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(executedToolCalls).toEqual([
+        {
+          name: 'web_search',
+          args: {
+            query: 'latest ai news'
+          }
+        }
+      ]);
+
+      const [, firstInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const firstBody = JSON.parse(String(firstInit.body));
+      expect(firstBody.stream).toBe(true);
+      expect(firstBody.tools).toHaveLength(1);
+
+      const [, secondInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+      const secondBody = JSON.parse(String(secondInit.body));
+      expect(secondBody.stream).toBe(true);
+      expect(JSON.stringify(secondBody.messages)).toContain('fresh result');
+      expect(response.body).toContain('fresh stream answer');
+      expect(response.body).toContain('data: [DONE]');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('optimistically streams virtual model content while intercepting internal tool calls', async () => {
+    const firstStream = [
+      'data: {"id":"chatcmpl_virtual_websearch_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"reasoning_content":"think "}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"checking "}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_web_search_optimistic_1","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"latest ai news\\"}"}}]}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const secondStream = [
+      'data: {"id":"chatcmpl_virtual_websearch_optimistic_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_optimistic_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"fresh answer"}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_optimistic_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(firstStream, {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream'
+          }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(secondStream, {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream'
+          }
+        })
+      );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executedToolCalls: Array<{ name: string; args: unknown }> = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        {
+          name: 'web_search',
+          description: 'Search the web',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      ],
+      has: async () => true,
+      execute: async (name: string, input: { args: unknown }) => {
+        executedToolCalls.push({ name, args: input.args });
+        return {
+          hits: ['fresh result']
+        };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'virtual-websearch-optimistic',
+          key: 'websearch',
+          displayName: 'Web Search',
+          enabled: true,
+          match: {
+            exactAliases: [],
+            prefixes: [],
+            suffixes: [':websearch']
+          },
+          baseModel: {
+            mode: 'strip_suffix'
+          },
+          tools: [
+            {
+              name: 'web_search',
+              visibility: 'internal'
+            }
+          ],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'deny',
+            matchWebSearch: true,
+            streamMode: 'optimistic'
+          },
+          materialization: {
+            enabled: true,
+            includeInGatewayModels: true
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'openai-main/glm-5:websearch',
+          input: 'What happened today?',
+          stream: true,
+          tools: [
+            {
+              type: 'web_search'
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(executedToolCalls).toEqual([
+        {
+          name: 'web_search',
+          args: {
+            query: 'latest ai news'
+          }
+        }
+      ]);
+
+      expect(response.body).toContain('"type":"response.reasoning_text.delta"');
+      expect(response.body).toContain('"delta":"think "');
+      expect(response.body).toContain('"type":"response.output_text.delta","delta":"checking "');
+      expect(response.body).toContain('"type":"response.output_text.delta","delta":"fresh answer"');
+      expect(response.body).not.toContain('"name":"web_search"');
+      expect(response.body).not.toContain('call_web_search_optimistic_1');
+      expect(response.body).toContain('data: [DONE]');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('optimistically streams virtual model content as Anthropic messages while intercepting internal tool calls', async () => {
+    const firstStream = [
+      'data: {"id":"chatcmpl_virtual_websearch_messages_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_messages_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"reasoning_content":"think "}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_messages_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"checking "}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_messages_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_web_search_messages_optimistic_1","type":"function","function":{"name":"web_search","arguments":"{\\"query\\":\\"latest ai news\\"}"}}]}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_messages_optimistic_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const secondStream = [
+      'data: {"id":"chatcmpl_virtual_websearch_messages_optimistic_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_messages_optimistic_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"fresh answer"}}]}\n\n',
+      'data: {"id":"chatcmpl_virtual_websearch_messages_optimistic_2","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":6,"completion_tokens":4,"total_tokens":10}}\n\n',
+      'data: [DONE]\n\n'
+    ].join('');
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(firstStream, {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream'
+          }
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response(secondStream, {
+          status: 200,
+          headers: {
+            'content-type': 'text/event-stream'
+          }
+        })
+      );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const executedToolCalls: Array<{ name: string; args: unknown }> = [];
+    const toolProvider = {
+      listDefinitions: async () => [
+        {
+          name: 'web_search',
+          description: 'Search the web',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      ],
+      has: async () => true,
+      execute: async (name: string, input: { args: unknown }) => {
+        executedToolCalls.push({ name, args: input.args });
+        return {
+          hits: ['fresh result']
+        };
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'virtual-websearch-messages-optimistic',
+          key: 'websearch',
+          displayName: 'Web Search',
+          enabled: true,
+          match: {
+            exactAliases: [],
+            prefixes: [],
+            suffixes: [':websearch']
+          },
+          baseModel: {
+            mode: 'strip_suffix'
+          },
+          tools: [
+            {
+              name: 'web_search',
+              visibility: 'internal'
+            }
+          ],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'deny',
+            matchWebSearch: true,
+            streamMode: 'optimistic'
+          },
+          materialization: {
+            enabled: true,
+            includeInGatewayModels: true
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'openai-main/glm-5:websearch',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'What happened today?' }],
+          tools: [
+            {
+              type: 'web_search_20250305',
+              name: 'web_search'
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(executedToolCalls).toEqual([
+        {
+          name: 'web_search',
+          args: {
+            query: 'latest ai news'
+          }
+        }
+      ]);
+
+      const [, firstInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const firstBody = JSON.parse(String(firstInit.body));
+      expect(firstBody.stream).toBe(true);
+      expect(firstBody.tools?.[0]?.function?.name).toBe('web_search');
+
+      const [, secondInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+      const secondBody = JSON.parse(String(secondInit.body));
+      expect(secondBody.stream).toBe(true);
+      expect(JSON.stringify(secondBody.messages)).toContain('fresh result');
+
+      expect(response.body).toContain('event: message_start');
+      expect(response.body).toContain('"type":"thinking_delta","thinking":"think "');
+      expect(response.body).toContain('"type":"text_delta","text":"checking "');
+      expect(response.body).toContain('"type":"text_delta","text":"fresh answer"');
+      expect(response.body).not.toContain('"name":"web_search"');
+      expect(response.body).not.toContain('call_web_search_messages_optimistic_1');
+      expect(response.body).not.toContain('event: error');
+      expect(response.body.endsWith('event: message_stop\ndata: {"type":"message_stop"}\n\n')).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('emits an Anthropic error event when optimistic upstream streaming fails after partial relay', async () => {
+    const fetchMock = vi.fn(async () =>
+      createErroringSseResponse(
+        [
+          [
+            'data: {"id":"chatcmpl_virtual_websearch_messages_error_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+            'data: {"id":"chatcmpl_virtual_websearch_messages_error_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"partial answer"}}]}\n\n'
+          ].join('')
+        ],
+        new Error('upstream stream reset')
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const toolProvider = {
+      listDefinitions: async () => [
+        {
+          name: 'web_search',
+          description: 'Search the web',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string'
+              }
+            }
+          }
+        }
+      ],
+      has: async () => true,
+      execute: async () => {
+        throw new Error('should not execute');
+      },
+      close: async () => undefined
+    };
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+      undefined,
+      [
+        {
+          id: 'virtual-websearch-messages-optimistic-error',
+          key: 'websearch',
+          displayName: 'Web Search',
+          enabled: true,
+          match: {
+            exactAliases: [],
+            prefixes: [],
+            suffixes: [':websearch']
+          },
+          baseModel: {
+            mode: 'strip_suffix'
+          },
+          tools: [
+            {
+              name: 'web_search',
+              visibility: 'internal'
+            }
+          ],
+          execution: {
+            mode: 'tool_loop',
+            maxTurns: 4,
+            maxToolCalls: 4,
+            clientToolsPolicy: 'deny',
+            matchWebSearch: true,
+            streamMode: 'optimistic'
+          },
+          materialization: {
+            enabled: true,
+            includeInGatewayModels: true
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config, toolProvider as any));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'openai-main/glm-5:websearch',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'What happened today?' }],
+          tools: [
+            {
+              type: 'web_search_20250305',
+              name: 'web_search'
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(response.body).toContain('event: message_start');
+      expect(response.body).toContain('"type":"text_delta","text":"partial answer"');
+      expect(response.body).toContain('event: error');
+      expect(response.body).toContain('Optimistic virtual model stream failed: upstream stream reset');
+      expect(response.body).not.toContain('event: message_stop');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('streams buffered virtual model responses as OpenAI Responses events', async () => {
     const fetchMock = vi
       .fn()
@@ -4609,11 +5594,11 @@ describe('gateway routes protocol conversion', () => {
 
       const [, firstInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       const firstBody = JSON.parse(String(firstInit.body));
-      expect(firstBody.stream).toBeUndefined();
+      expect(firstBody.stream).toBe(true);
 
       const [, secondInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
       const secondBody = JSON.parse(String(secondInit.body));
-      expect(secondBody.stream).toBeUndefined();
+      expect(secondBody.stream).toBe(true);
 
       expect(response.body).toContain('"type":"response.created"');
       expect(response.body).toContain('"type":"response.output_item.added","output_index":0');
@@ -5388,6 +6373,24 @@ function createSseResponse(chunks: string[]): Response {
         controller.enqueue(new TextEncoder().encode(chunk));
       }
       controller.close();
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8'
+    }
+  });
+}
+
+function createErroringSseResponse(chunks: string[], error: Error): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(new TextEncoder().encode(chunk));
+      }
+      setTimeout(() => controller.error(error), 0);
     }
   });
 
