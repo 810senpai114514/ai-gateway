@@ -52,6 +52,35 @@ export interface ProviderHealthConfig {
   checkedAt?: string;
 }
 
+export type ProviderCacheScope = 'provider' | 'provider_model' | 'credential' | 'credential_model';
+
+export interface ProviderCacheConfig {
+  enabled: boolean;
+  scope: ProviderCacheScope;
+  ttlMs: number;
+  minPrefixTokens: number;
+  maxWaitMs: number;
+}
+
+export interface ProviderCredentialLimitConfig {
+  rpm?: number;
+  tpm?: number;
+  rpd?: number;
+  tpd?: number;
+  ipm?: number;
+}
+
+export interface ProviderCredentialConfig {
+  id: string;
+  apikey?: string;
+  apiKeyEnv?: string;
+  enabled: boolean;
+  priority: number;
+  weight: number;
+  limits?: ProviderCredentialLimitConfig;
+  cache?: ProviderCacheConfig;
+}
+
 export interface ProviderConfig {
   name: string;
   type: ProviderType;
@@ -65,6 +94,11 @@ export interface ProviderConfig {
   extraBody: ModelScopedBodyConfig;
   billing: ModelScopedBillingConfig;
   health?: ProviderHealthConfig;
+  cache?: ProviderCacheConfig;
+  credentials?: ProviderCredentialConfig[];
+  credentialId?: string;
+  credentialLimits?: ProviderCredentialLimitConfig;
+  credentialSourceProviderName?: string;
 }
 
 export interface ProviderExternalSourceConfig {
@@ -341,6 +375,43 @@ export interface GatewayRoutingConfig {
   preferSourceProviderForBareModels: boolean;
 }
 
+export interface GatewaySchedulingCacheAffinityConfig {
+  enabled: boolean;
+  ttlMs: number;
+  defaultScope: ProviderCacheScope;
+  minPrefixTokens: number;
+  maxWaitMs: number;
+}
+
+export interface GatewaySchedulingCredentialCooldownConfig {
+  auth: number;
+  rateLimit: number;
+  serverError: number;
+  network: number;
+}
+
+export interface GatewaySchedulingCredentialSchedulerConfig {
+  enabled: boolean;
+  spilloverUtilization: number;
+  cooldownMs: GatewaySchedulingCredentialCooldownConfig;
+}
+
+export interface GatewaySchedulingFallbackConfig {
+  mode: 'off' | 'retry' | 'model_chain' | 'provider_chain' | 'adaptive';
+  maxAttempts: number;
+  retryStatusCodes: number[];
+  crossProviderStatusCodes: number[];
+  preserveCache: 'prefer' | 'strict' | 'off';
+  maxCacheWaitMs: number;
+}
+
+export interface GatewaySchedulingConfig {
+  enabled: boolean;
+  cacheAffinity: GatewaySchedulingCacheAffinityConfig;
+  credentialScheduler: GatewaySchedulingCredentialSchedulerConfig;
+  fallback: GatewaySchedulingFallbackConfig;
+}
+
 export interface GatewayModelListConfig {
   bareModelIds: boolean;
 }
@@ -355,6 +426,14 @@ export interface ProviderHealthCheckSchedulerConfig {
 export interface GatewayMetricsConfig {
   enabled: boolean;
   includeProviderHealth: boolean;
+}
+
+export type GatewayLogLevel = 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'trace' | 'silent';
+
+export interface GatewayLoggingConfig {
+  enabled: boolean;
+  level: GatewayLogLevel;
+  accessLog: boolean;
 }
 
 export interface GatewayCorsConfig {
@@ -646,6 +725,7 @@ export interface GatewayConfig {
   defaultTargetProvider?: Provider;
   defaultTargetProviders: Provider[];
   routing?: GatewayRoutingConfig;
+  scheduling: GatewaySchedulingConfig;
   modelList?: GatewayModelListConfig;
   openaiApiKey?: string;
   anthropicApiKey?: string;
@@ -665,6 +745,7 @@ export interface GatewayConfig {
   healthAwareRouting: GatewayHealthAwareRoutingConfig;
   providerHealthCheck: ProviderHealthCheckSchedulerConfig;
   metrics: GatewayMetricsConfig;
+  logging: GatewayLoggingConfig;
   cors: GatewayCorsConfig;
   idempotency: GatewayIdempotencyConfig;
   upstreamConcurrency: GatewayUpstreamConcurrencyConfig;

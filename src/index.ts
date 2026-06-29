@@ -38,13 +38,14 @@ import {
   registerMcpGatewayWebSocketRoute
 } from './mcp-gateway';
 import { closeRawTraceManager, initializeRawTraceManager } from './raw-trace';
-import type { GatewayConfig } from './types';
+import type { GatewayConfig, GatewayLoggingConfig } from './types';
 
 const codexResponsesWebSocketPath = '/v1/responses';
 const metricsRequestStarts = new WeakMap<object, bigint>();
 
 const fastify = Fastify({
-  logger: true,
+  logger: resolveFastifyLogger(config.logging),
+  disableRequestLogging: !config.logging.accessLog,
   genReqId: () => randomUUID(),
   bodyLimit: config.bodyLimitBytes
 });
@@ -377,4 +378,14 @@ function applyCorsHeaders(reply: {
 
 function resolveMetricsRouteLabel(request: { url: string; routeOptions?: { url?: string } }): string {
   return request.routeOptions?.url || request.url.split('?')[0] || 'unknown';
+}
+
+function resolveFastifyLogger(logging: GatewayLoggingConfig): boolean | { level: string } {
+  if (!logging.enabled || logging.level === 'silent') {
+    return false;
+  }
+
+  return {
+    level: logging.level
+  };
 }

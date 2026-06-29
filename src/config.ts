@@ -24,6 +24,7 @@ import type {
   GatewayExternalEventSinkTransport,
   GatewayHealthAwareRoutingConfig,
   GatewayIdempotencyConfig,
+  GatewayLoggingConfig,
   GatewayMetricsConfig,
   GatewayModelListConfig,
   GatewayPolicyConfig,
@@ -35,6 +36,7 @@ import type {
   GatewayRateLimitDimensionConfig,
   GatewayRateLimitMetric,
   GatewayRoutingConfig,
+  GatewaySchedulingConfig,
   GatewayTransparentToolExecutionConfig,
   GatewayTransparentToolUnknownPolicy,
   GatewayUpstreamCircuitBreakerConfig,
@@ -58,6 +60,10 @@ import type {
   ProviderPluginResponseMutationConfig,
   ProviderType,
   ProviderConfig,
+  ProviderCacheConfig,
+  ProviderCacheScope,
+  ProviderCredentialConfig,
+  ProviderCredentialLimitConfig,
   ProviderExternalSourceConfig,
   ProviderHealthCheckSchedulerConfig,
   ProviderHealthConfig,
@@ -135,6 +141,8 @@ interface ProviderJsonConfig {
   extraBody?: unknown;
   billing?: unknown;
   health?: unknown;
+  cache?: unknown;
+  credentials?: unknown;
   status?: unknown;
   available?: unknown;
   priority?: unknown;
@@ -142,6 +150,40 @@ interface ProviderJsonConfig {
   latency_ms?: unknown;
   checkedAt?: unknown;
   checked_at?: unknown;
+}
+
+interface ProviderCacheJsonConfig {
+  enabled?: unknown;
+  scope?: unknown;
+  ttlMs?: unknown;
+  ttlSeconds?: unknown;
+  minPrefixTokens?: unknown;
+  maxWaitMs?: unknown;
+  maxWaitSeconds?: unknown;
+}
+
+interface ProviderCredentialJsonConfig {
+  id?: unknown;
+  name?: unknown;
+  label?: unknown;
+  enabled?: unknown;
+  apikey?: unknown;
+  apiKey?: unknown;
+  api_key?: unknown;
+  apiKeyEnv?: unknown;
+  apikeyEnv?: unknown;
+  priority?: unknown;
+  weight?: unknown;
+  limits?: unknown;
+  cache?: unknown;
+}
+
+interface ProviderCredentialLimitJsonConfig {
+  rpm?: unknown;
+  tpm?: unknown;
+  rpd?: unknown;
+  tpd?: unknown;
+  ipm?: unknown;
 }
 
 interface ProviderHealthJsonConfig {
@@ -215,6 +257,14 @@ interface ProviderHealthCheckSchedulerJsonConfig {
 interface GatewayMetricsJsonConfig {
   enabled?: unknown;
   includeProviderHealth?: unknown;
+}
+
+interface GatewayLoggingJsonConfig {
+  enabled?: unknown;
+  level?: unknown;
+  accessLog?: unknown;
+  accessLogging?: unknown;
+  requestLogging?: unknown;
 }
 
 interface GatewayCorsJsonConfig {
@@ -512,6 +562,7 @@ interface GatewayJsonConfig {
   healthAwareRouting?: unknown;
   providerHealthCheck?: unknown;
   metrics?: unknown;
+  logging?: unknown;
   cors?: unknown;
   idempotency?: unknown;
   upstreamConcurrency?: unknown;
@@ -519,6 +570,7 @@ interface GatewayJsonConfig {
   upstreamRetry?: unknown;
   transparentToolExecution?: unknown;
   routing?: unknown;
+  scheduling?: unknown;
   billing?: {
     enabled?: unknown;
     rates?: {
@@ -532,6 +584,47 @@ interface GatewayJsonConfig {
   rawTrace?: unknown;
   agent?: unknown;
   mcpGateway?: unknown;
+}
+
+interface GatewaySchedulingJsonConfig {
+  enabled?: unknown;
+  cacheAffinity?: unknown;
+  credentialScheduler?: unknown;
+  fallback?: unknown;
+}
+
+interface GatewaySchedulingCacheAffinityJsonConfig {
+  enabled?: unknown;
+  ttlMs?: unknown;
+  ttlSeconds?: unknown;
+  defaultScope?: unknown;
+  scope?: unknown;
+  minPrefixTokens?: unknown;
+  maxWaitMs?: unknown;
+  maxWaitSeconds?: unknown;
+}
+
+interface GatewaySchedulingCredentialSchedulerJsonConfig {
+  enabled?: unknown;
+  spilloverUtilization?: unknown;
+  cooldownMs?: unknown;
+}
+
+interface GatewaySchedulingCredentialCooldownJsonConfig {
+  auth?: unknown;
+  rateLimit?: unknown;
+  serverError?: unknown;
+  network?: unknown;
+}
+
+interface GatewaySchedulingFallbackJsonConfig {
+  mode?: unknown;
+  maxAttempts?: unknown;
+  retryStatusCodes?: unknown;
+  crossProviderStatusCodes?: unknown;
+  preserveCache?: unknown;
+  maxCacheWaitMs?: unknown;
+  maxCacheWaitSeconds?: unknown;
 }
 
 interface AgentRuntimeJsonConfig {
@@ -812,6 +905,7 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
       providers
     ),
     routing: parseGatewayRoutingConfig(routingSettings),
+    scheduling: parseGatewaySchedulingConfig(jsonConfig.scheduling),
     modelList: parseGatewayModelListConfig(jsonConfig.modelList),
     openaiApiKey:
       readString(process.env.OPENAI_API_KEY) ||
@@ -878,6 +972,7 @@ function buildGatewayConfig(jsonConfig: GatewayJsonConfig): GatewayConfig {
     healthAwareRouting: parseGatewayHealthAwareRoutingConfig(healthAwareRoutingRaw),
     providerHealthCheck: parseProviderHealthCheckSchedulerConfig(jsonConfig.providerHealthCheck),
     metrics: parseGatewayMetricsConfig(jsonConfig.metrics),
+    logging: parseGatewayLoggingConfig(jsonConfig.logging),
     cors: parseGatewayCorsConfig(jsonConfig.cors),
     idempotency: parseGatewayIdempotencyConfig(jsonConfig.idempotency),
     upstreamConcurrency: parseGatewayUpstreamConcurrencyConfig(jsonConfig.upstreamConcurrency),
@@ -1336,6 +1431,166 @@ function parseGatewayRoutingConfig(value: GatewayRoutingJsonConfig | undefined):
   };
 }
 
+function parseGatewaySchedulingConfig(value: unknown): GatewaySchedulingConfig {
+  const raw = isPlainObject(value) ? (value as GatewaySchedulingJsonConfig) : undefined;
+  const cacheAffinityRaw = isPlainObject(raw?.cacheAffinity)
+    ? (raw.cacheAffinity as GatewaySchedulingCacheAffinityJsonConfig)
+    : undefined;
+  const credentialSchedulerRaw = isPlainObject(raw?.credentialScheduler)
+    ? (raw.credentialScheduler as GatewaySchedulingCredentialSchedulerJsonConfig)
+    : undefined;
+  const cooldownRaw = isPlainObject(credentialSchedulerRaw?.cooldownMs)
+    ? (credentialSchedulerRaw.cooldownMs as GatewaySchedulingCredentialCooldownJsonConfig)
+    : undefined;
+  const fallbackRaw = isPlainObject(raw?.fallback)
+    ? (raw.fallback as GatewaySchedulingFallbackJsonConfig)
+    : undefined;
+
+  return {
+    enabled: resolveBoolean(process.env.GATEWAY_SCHEDULING_ENABLED, raw?.enabled, false),
+    cacheAffinity: {
+      enabled: resolveBoolean(
+        process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_ENABLED,
+        cacheAffinityRaw?.enabled,
+        true
+      ),
+      ttlMs: resolvePrecheckWindowMs(
+        [process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_TTL_MS, cacheAffinityRaw?.ttlMs],
+        [process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_TTL_SECONDS, cacheAffinityRaw?.ttlSeconds],
+        600000
+      ),
+      defaultScope:
+        parseProviderCacheScope(
+          readString(process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_SCOPE) ||
+            readString(cacheAffinityRaw?.defaultScope) ||
+            readString(cacheAffinityRaw?.scope)
+        ) || 'credential_model',
+      minPrefixTokens: resolveInteger(
+        [
+          process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_MIN_PREFIX_TOKENS,
+          cacheAffinityRaw?.minPrefixTokens
+        ],
+        1024,
+        0
+      ),
+      maxWaitMs: resolvePrecheckWindowMs(
+        [
+          process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_MAX_WAIT_MS,
+          cacheAffinityRaw?.maxWaitMs
+        ],
+        [
+          process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_MAX_WAIT_SECONDS,
+          cacheAffinityRaw?.maxWaitSeconds
+        ],
+        3000
+      )
+    },
+    credentialScheduler: {
+      enabled: resolveBoolean(
+        process.env.GATEWAY_SCHEDULING_CREDENTIAL_SCHEDULER_ENABLED,
+        credentialSchedulerRaw?.enabled,
+        true
+      ),
+      spilloverUtilization: clampNumber(
+        resolveNonNegativeNumber(
+          [
+            process.env.GATEWAY_SCHEDULING_CREDENTIAL_SPILLOVER_UTILIZATION,
+            credentialSchedulerRaw?.spilloverUtilization
+          ],
+          0.8
+        ),
+        0,
+        1
+      ),
+      cooldownMs: {
+        auth: resolvePrecheckWindowMs(
+          [process.env.GATEWAY_SCHEDULING_CREDENTIAL_AUTH_COOLDOWN_MS, cooldownRaw?.auth],
+          [process.env.GATEWAY_SCHEDULING_CREDENTIAL_AUTH_COOLDOWN_SECONDS],
+          300000
+        ),
+        rateLimit: resolvePrecheckWindowMs(
+          [process.env.GATEWAY_SCHEDULING_CREDENTIAL_RATE_LIMIT_COOLDOWN_MS, cooldownRaw?.rateLimit],
+          [process.env.GATEWAY_SCHEDULING_CREDENTIAL_RATE_LIMIT_COOLDOWN_SECONDS],
+          60000
+        ),
+        serverError: resolvePrecheckWindowMs(
+          [process.env.GATEWAY_SCHEDULING_CREDENTIAL_SERVER_ERROR_COOLDOWN_MS, cooldownRaw?.serverError],
+          [process.env.GATEWAY_SCHEDULING_CREDENTIAL_SERVER_ERROR_COOLDOWN_SECONDS],
+          60000
+        ),
+        network: resolvePrecheckWindowMs(
+          [process.env.GATEWAY_SCHEDULING_CREDENTIAL_NETWORK_COOLDOWN_MS, cooldownRaw?.network],
+          [process.env.GATEWAY_SCHEDULING_CREDENTIAL_NETWORK_COOLDOWN_SECONDS],
+          30000
+        )
+      }
+    },
+    fallback: {
+      mode: parseGatewaySchedulingFallbackMode(
+        readString(process.env.GATEWAY_SCHEDULING_FALLBACK_MODE) || readString(fallbackRaw?.mode)
+      ),
+      maxAttempts: resolveInteger(
+        [process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_ATTEMPTS, fallbackRaw?.maxAttempts],
+        4,
+        1
+      ),
+      retryStatusCodes: parseStatusCodeList(
+        process.env.GATEWAY_SCHEDULING_FALLBACK_RETRY_STATUS_CODES,
+        fallbackRaw?.retryStatusCodes,
+        [408, 409, 429, 500, 502, 503, 504]
+      ),
+      crossProviderStatusCodes: parseStatusCodeList(
+        process.env.GATEWAY_SCHEDULING_FALLBACK_CROSS_PROVIDER_STATUS_CODES,
+        fallbackRaw?.crossProviderStatusCodes,
+        [401, 403, 404, 429, 500, 502, 503, 504]
+      ),
+      preserveCache: parseGatewaySchedulingPreserveCache(
+        readString(process.env.GATEWAY_SCHEDULING_FALLBACK_PRESERVE_CACHE) ||
+          readString(fallbackRaw?.preserveCache)
+      ),
+      maxCacheWaitMs: resolvePrecheckWindowMs(
+        [
+          process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_CACHE_WAIT_MS,
+          fallbackRaw?.maxCacheWaitMs
+        ],
+        [
+          process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_CACHE_WAIT_SECONDS,
+          fallbackRaw?.maxCacheWaitSeconds
+        ],
+        3000
+      )
+    }
+  };
+}
+
+function parseGatewaySchedulingFallbackMode(
+  value: string | undefined
+): GatewaySchedulingConfig['fallback']['mode'] {
+  const normalized = value?.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (
+    normalized === 'off' ||
+    normalized === 'retry' ||
+    normalized === 'model_chain' ||
+    normalized === 'provider_chain' ||
+    normalized === 'adaptive'
+  ) {
+    return normalized;
+  }
+
+  return 'adaptive';
+}
+
+function parseGatewaySchedulingPreserveCache(
+  value: string | undefined
+): GatewaySchedulingConfig['fallback']['preserveCache'] {
+  const normalized = value?.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (normalized === 'strict' || normalized === 'off' || normalized === 'prefer') {
+    return normalized;
+  }
+
+  return 'prefer';
+}
+
 function parseGatewayModelListConfig(value: unknown): GatewayModelListConfig {
   const raw = isPlainObject(value) ? (value as GatewayModelListJsonConfig) : undefined;
   return {
@@ -1381,6 +1636,46 @@ function parseGatewayMetricsConfig(value: unknown): GatewayMetricsConfig {
       true
     )
   };
+}
+
+function parseGatewayLoggingConfig(value: unknown): GatewayLoggingConfig {
+  const raw = isPlainObject(value) ? (value as GatewayLoggingJsonConfig) : undefined;
+  const configuredLevel = readString(process.env.GATEWAY_LOG_LEVEL) || readString(raw?.level);
+  const level = parseGatewayLogLevel(configuredLevel);
+  const enabled = level === 'silent'
+    ? false
+    : resolveBoolean(
+        process.env.GATEWAY_LOG_ENABLED,
+        raw?.enabled,
+        configuredLevel !== undefined
+      );
+
+  return {
+    enabled,
+    level,
+    accessLog: resolveBoolean(
+      process.env.GATEWAY_ACCESS_LOG,
+      raw?.accessLog ?? raw?.accessLogging ?? raw?.requestLogging,
+      false
+    )
+  };
+}
+
+function parseGatewayLogLevel(value: string | undefined): GatewayLoggingConfig['level'] {
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === 'fatal' ||
+    normalized === 'error' ||
+    normalized === 'warn' ||
+    normalized === 'info' ||
+    normalized === 'debug' ||
+    normalized === 'trace' ||
+    normalized === 'silent'
+  ) {
+    return normalized;
+  }
+
+  return 'info';
 }
 
 function parseGatewayCorsConfig(value: unknown): GatewayCorsConfig {
@@ -3196,13 +3491,108 @@ function parseProvidersConfig(value: unknown): ProviderConfig[] {
       extraHeaders: parseModelScopedHeaders(item.extraHeaders, models),
       extraBody: parseModelScopedBody(item.extraBody, models),
       billing: parseModelScopedBilling(item.billing, models),
-      health: parseProviderHealthConfig(item)
+      health: parseProviderHealthConfig(item),
+      cache: parseProviderCacheConfig(item.cache),
+      credentials: parseProviderCredentialsConfig(item.credentials)
     };
 
     parsed.push(providerConfig);
   }
 
   return parsed;
+}
+
+function parseProviderCredentialsConfig(value: unknown): ProviderCredentialConfig[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const parsed: ProviderCredentialConfig[] = [];
+  const usedIds = new Set<string>();
+
+  for (const entry of value) {
+    if (!isPlainObject(entry)) {
+      continue;
+    }
+
+    const item = entry as ProviderCredentialJsonConfig;
+    const idBase =
+      readString(item.id) ||
+      readString(item.name) ||
+      readString(item.label) ||
+      `key-${parsed.length + 1}`;
+    const apiKeyEnvName = readString(item.apiKeyEnv) || readString(item.apikeyEnv);
+    const apiKeyFromEnv = apiKeyEnvName ? readString(process.env[apiKeyEnvName]) : undefined;
+    const apikey =
+      readString(item.apikey) ||
+      readString(item.apiKey) ||
+      readString(item.api_key) ||
+      apiKeyFromEnv;
+
+    if (!apikey && !apiKeyEnvName) {
+      continue;
+    }
+
+    parsed.push({
+      id: uniqueProviderName(idBase, usedIds),
+      apikey,
+      apiKeyEnv: apiKeyEnvName,
+      enabled: readBoolean(item.enabled) ?? true,
+      priority: resolveInteger([item.priority], parsed.length + 1, 1),
+      weight: resolvePositiveNumber([item.weight], 1),
+      limits: parseProviderCredentialLimits(item.limits),
+      cache: parseProviderCacheConfig(item.cache)
+    });
+  }
+
+  return parsed.length > 0 ? parsed : undefined;
+}
+
+function parseProviderCredentialLimits(value: unknown): ProviderCredentialLimitConfig | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const raw = value as ProviderCredentialLimitJsonConfig;
+  const limits: ProviderCredentialLimitConfig = {};
+  const rpm = readNonNegativeNumber(raw.rpm);
+  const tpm = readNonNegativeNumber(raw.tpm);
+  const rpd = readNonNegativeNumber(raw.rpd);
+  const tpd = readNonNegativeNumber(raw.tpd);
+  const ipm = readNonNegativeNumber(raw.ipm);
+
+  if (rpm !== undefined) limits.rpm = Math.trunc(rpm);
+  if (tpm !== undefined) limits.tpm = Math.trunc(tpm);
+  if (rpd !== undefined) limits.rpd = Math.trunc(rpd);
+  if (tpd !== undefined) limits.tpd = Math.trunc(tpd);
+  if (ipm !== undefined) limits.ipm = Math.trunc(ipm);
+
+  return Object.keys(limits).length > 0 ? limits : undefined;
+}
+
+function parseProviderCacheConfig(value: unknown): ProviderCacheConfig | undefined {
+  if (typeof value === 'boolean') {
+    return {
+      enabled: value,
+      scope: 'credential_model',
+      ttlMs: 600000,
+      minPrefixTokens: 1024,
+      maxWaitMs: 3000
+    };
+  }
+
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const raw = value as ProviderCacheJsonConfig;
+  return {
+    enabled: readBoolean(raw.enabled) ?? true,
+    scope: parseProviderCacheScope(readString(raw.scope)) || 'credential_model',
+    ttlMs: resolvePrecheckWindowMs([raw.ttlMs], [raw.ttlSeconds], 600000),
+    minPrefixTokens: resolveInteger([raw.minPrefixTokens], 1024, 0),
+    maxWaitMs: resolvePrecheckWindowMs([raw.maxWaitMs], [raw.maxWaitSeconds], 3000)
+  };
 }
 
 function parseProviderPluginsConfig(value: unknown): ProviderPluginConfig[] {
@@ -3730,6 +4120,20 @@ function parseOpenAIChatStreamUsageToken(value: unknown): ProviderConfig['openai
   return undefined;
 }
 
+function parseProviderCacheScope(value: string | undefined): ProviderCacheScope | undefined {
+  const normalized = value?.trim().toLowerCase().replace(/[-\s]+/g, '_');
+  if (
+    normalized === 'provider' ||
+    normalized === 'provider_model' ||
+    normalized === 'credential' ||
+    normalized === 'credential_model'
+  ) {
+    return normalized;
+  }
+
+  return undefined;
+}
+
 function parseModelScopedHeaders(value: unknown, models: string[]): ModelScopedHeadersConfig {
   if (!isPlainObject(value)) {
     return {
@@ -4003,6 +4407,14 @@ function resolvePositiveNumber(values: unknown[], fallback: number): number {
   }
 
   return fallback;
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+
+  return Math.min(max, Math.max(min, value));
 }
 
 function resolveInteger(values: unknown[], fallback: number, minValue: number): number {

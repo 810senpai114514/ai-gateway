@@ -14,6 +14,8 @@
     "release": "node scripts/release.mjs",
     "test:sdk:responses": "node scripts/test-openai-responses-sdk.mjs",
     "test": "vitest",
+    "bench": "vitest bench",
+    "bench:server": "node scripts/benchmark-gateway-server.mjs",
     "test:coverage": "vitest --coverage"
   },
   "keywords": [

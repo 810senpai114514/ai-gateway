@@ -18,6 +18,9 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.PROVIDER_HEALTH_CHECK_INITIAL_DELAY_SECONDS;
     delete process.env.GATEWAY_METRICS_ENABLED;
     delete process.env.GATEWAY_METRICS_INCLUDE_PROVIDER_HEALTH;
+    delete process.env.GATEWAY_LOG_ENABLED;
+    delete process.env.GATEWAY_LOG_LEVEL;
+    delete process.env.GATEWAY_ACCESS_LOG;
     delete process.env.GATEWAY_CORS_ENABLED;
     delete process.env.GATEWAY_CORS_ORIGIN;
     delete process.env.GATEWAY_CORS_ORIGINS;
@@ -51,6 +54,31 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.GATEWAY_UPSTREAM_RETRY_JITTER_MS;
     delete process.env.GATEWAY_UPSTREAM_RETRY_JITTER_SECONDS;
     delete process.env.GATEWAY_UPSTREAM_RETRY_STATUS_CODES;
+    delete process.env.GATEWAY_SCHEDULING_ENABLED;
+    delete process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_ENABLED;
+    delete process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_TTL_MS;
+    delete process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_TTL_SECONDS;
+    delete process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_SCOPE;
+    delete process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_MIN_PREFIX_TOKENS;
+    delete process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_MAX_WAIT_MS;
+    delete process.env.GATEWAY_SCHEDULING_CACHE_AFFINITY_MAX_WAIT_SECONDS;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_SCHEDULER_ENABLED;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_SPILLOVER_UTILIZATION;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_AUTH_COOLDOWN_MS;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_AUTH_COOLDOWN_SECONDS;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_RATE_LIMIT_COOLDOWN_MS;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_RATE_LIMIT_COOLDOWN_SECONDS;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_SERVER_ERROR_COOLDOWN_MS;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_SERVER_ERROR_COOLDOWN_SECONDS;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_NETWORK_COOLDOWN_MS;
+    delete process.env.GATEWAY_SCHEDULING_CREDENTIAL_NETWORK_COOLDOWN_SECONDS;
+    delete process.env.GATEWAY_SCHEDULING_FALLBACK_MODE;
+    delete process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_ATTEMPTS;
+    delete process.env.GATEWAY_SCHEDULING_FALLBACK_RETRY_STATUS_CODES;
+    delete process.env.GATEWAY_SCHEDULING_FALLBACK_CROSS_PROVIDER_STATUS_CODES;
+    delete process.env.GATEWAY_SCHEDULING_FALLBACK_PRESERVE_CACHE;
+    delete process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_CACHE_WAIT_MS;
+    delete process.env.GATEWAY_SCHEDULING_FALLBACK_MAX_CACHE_WAIT_SECONDS;
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_ENABLED;
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_MAX_TURNS;
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_MAX_TOOL_CALLS;
@@ -59,6 +87,7 @@ describe('Gateway config providerPlugins', () => {
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_ALLOW_TOOLS;
     delete process.env.GATEWAY_TRANSPARENT_TOOL_EXECUTION_DENY_TOOLS;
     delete process.env.TEST_PROVIDER_API_KEY;
+    delete process.env.TEST_PROVIDER_CREDENTIAL_A;
     delete process.env.AUTH_MODE;
     delete process.env.AUTH_STATIC_API_KEY;
     delete process.env.AUTH_STATIC_API_KEYS;
@@ -161,6 +190,170 @@ describe('Gateway config providerPlugins', () => {
     });
   });
 
+  it('keeps gateway scheduling disabled by default', () => {
+    const config = parseGatewayConfigFromRaw({});
+
+    expect(config.scheduling).toEqual({
+      enabled: false,
+      cacheAffinity: {
+        enabled: true,
+        ttlMs: 600000,
+        defaultScope: 'credential_model',
+        minPrefixTokens: 1024,
+        maxWaitMs: 3000
+      },
+      credentialScheduler: {
+        enabled: true,
+        spilloverUtilization: 0.8,
+        cooldownMs: {
+          auth: 300000,
+          rateLimit: 60000,
+          serverError: 60000,
+          network: 30000
+        }
+      },
+      fallback: {
+        mode: 'adaptive',
+        maxAttempts: 4,
+        retryStatusCodes: [408, 409, 429, 500, 502, 503, 504],
+        crossProviderStatusCodes: [401, 403, 404, 429, 500, 502, 503, 504],
+        preserveCache: 'prefer',
+        maxCacheWaitMs: 3000
+      }
+    });
+  });
+
+  it('parses scheduling and provider credential config', () => {
+    process.env.TEST_PROVIDER_CREDENTIAL_A = 'credential-env-secret';
+
+    const config = parseGatewayConfigFromRaw({
+      scheduling: {
+        enabled: true,
+        cacheAffinity: {
+          enabled: true,
+          ttlSeconds: 45,
+          defaultScope: 'provider-model',
+          minPrefixTokens: 256,
+          maxWaitSeconds: 2
+        },
+        credentialScheduler: {
+          enabled: true,
+          spilloverUtilization: 0.7,
+          cooldownMs: {
+            auth: 111,
+            rateLimit: 222,
+            serverError: 333,
+            network: 444
+          }
+        },
+        fallback: {
+          mode: 'provider-chain',
+          maxAttempts: 2,
+          retryStatusCodes: [429, 503],
+          crossProviderStatusCodes: [401, 429],
+          preserveCache: 'strict',
+          maxCacheWaitSeconds: 1
+        }
+      },
+      providers: [
+        {
+          name: 'openai-main',
+          type: 'openai_responses',
+          models: ['gpt-5.1'],
+          cache: {
+            enabled: true,
+            scope: 'credential',
+            ttlSeconds: 30,
+            minPrefixTokens: 2048,
+            maxWaitSeconds: 1
+          },
+          credentials: [
+            {
+              id: 'primary',
+              apiKeyEnv: 'TEST_PROVIDER_CREDENTIAL_A',
+              priority: 2,
+              weight: 3,
+              limits: {
+                rpm: 10,
+                tpm: 1000,
+                rpd: 100,
+                ipm: 5
+              }
+            },
+            {
+              name: 'primary',
+              api_key: 'inline-secret',
+              enabled: false,
+              priority: 1,
+              weight: 2
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(config.scheduling).toMatchObject({
+      enabled: true,
+      cacheAffinity: {
+        ttlMs: 45000,
+        defaultScope: 'provider_model',
+        minPrefixTokens: 256,
+        maxWaitMs: 2000
+      },
+      credentialScheduler: {
+        spilloverUtilization: 0.7,
+        cooldownMs: {
+          auth: 111,
+          rateLimit: 222,
+          serverError: 333,
+          network: 444
+        }
+      },
+      fallback: {
+        mode: 'provider_chain',
+        maxAttempts: 2,
+        retryStatusCodes: [429, 503],
+        crossProviderStatusCodes: [401, 429],
+        preserveCache: 'strict',
+        maxCacheWaitMs: 1000
+      }
+    });
+    expect(config.providers[0]?.cache).toEqual({
+      enabled: true,
+      scope: 'credential',
+      ttlMs: 30000,
+      minPrefixTokens: 2048,
+      maxWaitMs: 1000
+    });
+    expect(config.providers[0]?.credentials).toEqual([
+      {
+        id: 'primary',
+        apikey: 'credential-env-secret',
+        apiKeyEnv: 'TEST_PROVIDER_CREDENTIAL_A',
+        enabled: true,
+        priority: 2,
+        weight: 3,
+        limits: {
+          rpm: 10,
+          tpm: 1000,
+          rpd: 100,
+          ipm: 5
+        },
+        cache: undefined
+      },
+      {
+        id: 'primary-2',
+        apikey: 'inline-secret',
+        apiKeyEnv: undefined,
+        enabled: false,
+        priority: 1,
+        weight: 2,
+        limits: undefined,
+        cache: undefined
+      }
+    ]);
+  });
+
   it('parses OpenAI chat tools format compatibility config', () => {
     const config = parseGatewayConfigFromRaw({
       providers: [
@@ -196,6 +389,45 @@ describe('Gateway config providerPlugins', () => {
 
     expect(config.providers[0]?.openaiChatStreamUsage).toBe('include_usage');
     expect(config.providers[1]?.openaiChatStreamUsage).toBe('disabled');
+  });
+
+  it('parses gateway logging config from file and environment', () => {
+    expect(parseGatewayConfigFromRaw({}).logging).toEqual({
+      enabled: false,
+      level: 'info',
+      accessLog: false
+    });
+
+    const fromFile = parseGatewayConfigFromRaw({
+      logging: {
+        enabled: true,
+        level: 'warn',
+        accessLog: false
+      }
+    });
+
+    expect(fromFile.logging).toEqual({
+      enabled: true,
+      level: 'warn',
+      accessLog: false
+    });
+
+    process.env.GATEWAY_LOG_LEVEL = 'silent';
+    process.env.GATEWAY_ACCESS_LOG = 'false';
+
+    const fromEnv = parseGatewayConfigFromRaw({
+      logging: {
+        enabled: true,
+        level: 'debug',
+        accessLog: true
+      }
+    });
+
+    expect(fromEnv.logging).toEqual({
+      enabled: false,
+      level: 'silent',
+      accessLog: false
+    });
   });
 
   it('parses static API key auth config from file and environment', () => {

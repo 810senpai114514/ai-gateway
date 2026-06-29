@@ -11,6 +11,7 @@ import { registerGatewayIdempotencyHooks, resetGatewayIdempotencyForTests } from
 import { resetProviderCircuitBreakerForTests } from './upstream-circuit-breaker';
 import { resetProviderConcurrencyForTests } from './upstream-concurrency';
 import { resetGatewayPrecheckStateForTests } from './precheck';
+import { resetGatewaySchedulingStateForTests } from './scheduler';
 import { closeRawTraceManager, initializeRawTraceManager } from '../raw-trace';
 import { closeCodexOauthStateStore, updateDistributedCredentialEncryption } from '../provider/plugins';
 import type { GatewayConfig, ProviderConfig, ProviderPluginConfig, TargetAdapter } from '../types';
@@ -22,6 +23,7 @@ describe('gateway routes protocol conversion', () => {
     resetProviderCircuitBreakerForTests();
     resetProviderConcurrencyForTests();
     resetGatewayPrecheckStateForTests();
+    resetGatewaySchedulingStateForTests();
     await closeCodexOauthStateStore();
     await closeBillingPublisher();
     await closeRawTraceManager();
@@ -853,6 +855,306 @@ describe('gateway routes protocol conversion', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [upstreamUrl] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(upstreamUrl).toBe('https://backup.example/v1/chat/completions');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('expands provider credentials into scheduled upstream candidates', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_scheduled_key',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'scheduled key'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6,
+            prompt_tokens_details: {
+              cached_tokens: 2
+            }
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5']);
+    provider.baseurl = 'https://openai-main.example/v1';
+    provider.credentials = [
+      {
+        id: 'key-a',
+        apikey: 'credential-a',
+        enabled: true,
+        priority: 1,
+        weight: 3
+      },
+      {
+        id: 'key-b',
+        apikey: 'credential-b',
+        enabled: true,
+        priority: 1,
+        weight: 1
+      }
+    ];
+    const config = createConfig([provider]);
+    config.scheduling.enabled = true;
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'x-gateway-cache-affinity-key': 'session-a'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['x-gateway-scheduled-provider-name']).toBe('openai-main');
+      expect(response.headers['x-gateway-scheduled-credential-id']).toBe('key-a');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect((upstreamInit.headers as Record<string, string>).authorization).toBe('Bearer credential-a');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('cools down a rate-limited credential and falls back to the next credential', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: { message: 'rate limited' } }), {
+          status: 429,
+          headers: {
+            'content-type': 'application/json'
+          }
+        })
+      )
+      .mockImplementation(async () =>
+        new Response(
+          JSON.stringify({
+            id: 'chatcmpl_backup_key',
+            model: 'glm-5',
+            choices: [
+              {
+                index: 0,
+                finish_reason: 'stop',
+                message: {
+                  role: 'assistant',
+                  content: 'backup key'
+                }
+              }
+            ],
+            usage: {
+              prompt_tokens: 4,
+              completion_tokens: 2,
+              total_tokens: 6
+            }
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json'
+            }
+          }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5']);
+    provider.baseurl = 'https://openai-main.example/v1';
+    provider.credentials = [
+      {
+        id: 'key-a',
+        apikey: 'credential-a',
+        enabled: true,
+        priority: 1,
+        weight: 1
+      },
+      {
+        id: 'key-b',
+        apikey: 'credential-b',
+        enabled: true,
+        priority: 1,
+        weight: 1
+      }
+    ];
+    const config = createConfig([provider]);
+    config.scheduling.enabled = true;
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const first = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello'
+        }
+      });
+
+      expect(first.statusCode).toBe(200);
+      expect(first.headers['x-gateway-fallback-used']).toBe('true');
+      expect(first.headers['x-gateway-scheduled-credential-id']).toBe('key-b');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const [, firstAttemptInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const [, secondAttemptInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+      expect((firstAttemptInit.headers as Record<string, string>).authorization).toBe('Bearer credential-a');
+      expect((secondAttemptInit.headers as Record<string, string>).authorization).toBe('Bearer credential-b');
+
+      const second = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello again'
+        }
+      });
+
+      expect(second.statusCode).toBe(200);
+      expect(second.headers['x-gateway-scheduled-credential-id']).toBe('key-b');
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      const [, thirdAttemptInit] = fetchMock.mock.calls[2] as unknown as [string, RequestInit];
+      expect((thirdAttemptInit.headers as Record<string, string>).authorization).toBe('Bearer credential-b');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('uses upstream cache usage to keep a short request on the same scheduled credential', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_cached_key',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'cached key'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 2,
+            total_tokens: 6,
+            prompt_tokens_details: {
+              cached_tokens: 2
+            }
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5']);
+    provider.baseurl = 'https://openai-main.example/v1';
+    provider.credentials = [
+      {
+        id: 'key-a',
+        apikey: 'credential-a',
+        enabled: true,
+        priority: 1,
+        weight: 1
+      },
+      {
+        id: 'key-b',
+        apikey: 'credential-b',
+        enabled: true,
+        priority: 1,
+        weight: 1
+      }
+    ];
+    const config = createConfig([provider]);
+    config.scheduling.enabled = true;
+    config.scheduling.cacheAffinity.minPrefixTokens = 1024;
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const requestPayload = {
+        model: 'glm-5',
+        input: 'short'
+      };
+      const first = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'x-gateway-cache-affinity-key': 'session-cache-hit'
+        },
+        payload: requestPayload
+      });
+      const second = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'x-gateway-cache-affinity-key': 'session-cache-hit'
+        },
+        payload: requestPayload
+      });
+
+      expect(first.statusCode).toBe(200);
+      expect(second.statusCode).toBe(200);
+      expect(first.headers['x-gateway-scheduled-credential-id']).toBe('key-a');
+      expect(second.headers['x-gateway-scheduled-credential-id']).toBe('key-a');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const [, firstAttemptInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const [, secondAttemptInit] = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+      expect((firstAttemptInit.headers as Record<string, string>).authorization).toBe('Bearer credential-a');
+      expect((secondAttemptInit.headers as Record<string, string>).authorization).toBe('Bearer credential-a');
     } finally {
       await app.close();
     }
@@ -6689,6 +6991,34 @@ function createConfig(
       unhealthyStatuses: ['down'],
       preferHealthy: true,
       preferLowerLatency: true
+    },
+    scheduling: {
+      enabled: false,
+      cacheAffinity: {
+        enabled: true,
+        ttlMs: 600000,
+        defaultScope: 'credential_model',
+        minPrefixTokens: 0,
+        maxWaitMs: 3000
+      },
+      credentialScheduler: {
+        enabled: true,
+        spilloverUtilization: 0.8,
+        cooldownMs: {
+          auth: 300000,
+          rateLimit: 60000,
+          serverError: 60000,
+          network: 30000
+        }
+      },
+      fallback: {
+        mode: 'adaptive',
+        maxAttempts: 4,
+        retryStatusCodes: [408, 409, 429, 500, 502, 503, 504],
+        crossProviderStatusCodes: [401, 403, 404, 429, 500, 502, 503, 504],
+        preserveCache: 'prefer',
+        maxCacheWaitMs: 3000
+      }
     },
     providerHealthCheck: {
       enabled: false,

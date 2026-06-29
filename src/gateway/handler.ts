@@ -74,6 +74,12 @@ import {
   recordGatewayStreamConversion,
   recordGatewayToolExecution
 } from './metrics';
+import {
+  applyGatewayScheduling,
+  attachGatewaySchedulingHeaders,
+  recordGatewaySchedulingResponse,
+  recordGatewaySchedulingUsage
+} from './scheduler';
 import { createClientDisconnectSignal } from './client-disconnect';
 import {
   enqueueRawTraceCapture,
@@ -268,7 +274,12 @@ export async function handleGatewayRequest(
     return sendBadRequest(reply, targetProvidersResult.error);
   }
 
-  const targetProviders = applyHealthAwareRouting(targetProvidersResult.value, config);
+  const scheduledTargetProviders = applyGatewayScheduling(targetProvidersResult.value, {
+    config,
+    request,
+    requestModel: virtualModelResolution?.targetModelSelector || resolvePassthroughModel(body, source)
+  });
+  const targetProviders = applyHealthAwareRouting(scheduledTargetProviders, config);
   const isStreaming = sourceAdapter.isStreamingRequest(adapterInput);
 
   if (virtualModelResolution) {
@@ -607,7 +618,7 @@ export async function handleGatewayRequest(
           );
         }
 
-        attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length);
+        attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
         if (transformedPayload !== undefined) {
           return relayUpstreamResponseWithPayload(reply, upstreamResponse, transformedPayload);
         }
@@ -636,7 +647,7 @@ export async function handleGatewayRequest(
         );
       }
 
-      attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length);
+      attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
       if (isStreaming) {
         recordGatewayStreamConversion({
           sourceAdapter: source.adapterKey,
@@ -865,7 +876,7 @@ export async function handleGatewayRequest(
           rawTraceStreamResponse,
           clientAbortSignal
         );
-        attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length);
+        attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
         return relayConvertedStreamFromUpstreamResponse(
           reply,
           source,
@@ -981,7 +992,7 @@ export async function handleGatewayRequest(
           upstreamResponseBody: sourceStandardResponse
         }
       );
-      attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length);
+      attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
       return relayConvertedStreamFromStandardResponse(reply, source, sourceStandardResponse);
     }
 
@@ -1276,7 +1287,7 @@ export async function handleGatewayRequest(
       config
     });
 
-    attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length);
+    attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
     attachBillingHeaders(
       request,
       reply,
@@ -2046,7 +2057,7 @@ async function handleVirtualModelRequest(
           rawTraceStreamResponse,
           clientAbortSignal
         );
-        attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length);
+        attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
         return relayConvertedStreamFromUpstreamResponse(
           reply,
           source,
@@ -3378,7 +3389,8 @@ function sendOptimisticVirtualModelStream(input: {
     input.reply,
     input.targetProvider,
     input.targetProviderConfig?.name,
-    input.fallbackAttempts
+    input.fallbackAttempts,
+    input.targetProviderConfig
   );
   input.reply.code(200);
   input.reply.header('content-type', 'text/event-stream; charset=utf-8');
@@ -3622,6 +3634,14 @@ function publishOptimisticVirtualModelBillingEvent(
   response: StandardResponse,
   attemptSequence: number
 ): void {
+  recordGatewaySchedulingUsage({
+    config: input.config,
+    request: input.request,
+    providerConfig: input.targetProviderConfig,
+    model: response.model || input.model,
+    usage: response.usage
+  });
+
   if (!input.config.billing.enabled || !input.reply) {
     return;
   }
@@ -3680,7 +3700,7 @@ function sendVirtualModelResponse(
   standardRequest?: StandardRequest,
   upstreamRequest?: UpstreamRequest
 ) {
-  attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, fallbackAttempts);
+  attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, fallbackAttempts, targetProviderConfig);
 
   const sourceStandardResponse = prepareStandardResponseForSource(source, standardResponse, standardRequest);
 
@@ -4924,12 +4944,14 @@ function attachTargetRoutingHeaders(
   reply: FastifyReply,
   provider: Provider,
   providerName: string | undefined,
-  fallbackAttempts: number
+  fallbackAttempts: number,
+  providerConfig?: ProviderConfig
 ) {
   reply.header('x-gateway-target-provider', provider);
   if (providerName) {
     reply.header('x-gateway-target-provider-name', providerName);
   }
+  attachGatewaySchedulingHeaders(reply, providerConfig);
 
   if (fallbackAttempts > 0) {
     reply.header('x-gateway-fallback-used', 'true');
@@ -4952,6 +4974,14 @@ function attachBillingHeaders(
   trace?: GatewayBillingTrace,
   rawTraceCapture?: GatewayRawTraceCapture
 ) {
+  recordGatewaySchedulingUsage({
+    config,
+    request,
+    providerConfig: targetProviderConfig,
+    model,
+    usage
+  });
+
   if (!config.billing.enabled) {
     if (config.rawTrace.enabled) {
       publishRawTraceCaptureSafe(
@@ -5299,6 +5329,14 @@ async function tryPublishStreamingBillingEventFromUpstreamResponse(
   }
 
   const billingModel = resolveBillingModel(billingResponseResult.value.model, fallbackModel);
+  recordGatewaySchedulingUsage({
+    config,
+    request,
+    providerConfig: targetProviderConfig,
+    model: billingModel,
+    usage: billingResponseResult.value.usage
+  });
+
   const billing = calculateUsageBilling(
     targetProvider,
     billingResponseResult.value.usage,
@@ -5853,6 +5891,13 @@ async function callUpstreamWithFailureCapture(
       context.targetProviderConfig,
       response.status
     );
+    recordGatewaySchedulingResponse({
+      config: context.config,
+      request: context.request,
+      providerConfig: context.targetProviderConfig,
+      model: context.model,
+      statusCode: response.status
+    });
     return {
       ok: true,
       value: response
@@ -5868,6 +5913,13 @@ async function callUpstreamWithFailureCapture(
         context.targetProvider,
         context.targetProviderConfig
       );
+      recordGatewaySchedulingResponse({
+        config: context.config,
+        request: context.request,
+        providerConfig: context.targetProviderConfig,
+        model: context.model,
+        error: true
+      });
     }
     return {
       ok: false,
