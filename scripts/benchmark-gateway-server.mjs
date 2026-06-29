@@ -3,14 +3,14 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 const options = parseOptions(process.argv.slice(2));
 const root = process.cwd();
 
-let gatewayProcess;
+const gatewayProcesses = [];
 let mockServer;
 let tempDir;
 
@@ -22,40 +22,44 @@ try {
     });
   }
 
-  const gatewayPort = await getAvailablePort();
   const mockPort = await getAvailablePort();
   mockServer = await startMockUpstream(mockPort);
   tempDir = await mkdtemp(join(tmpdir(), 'next-ai-gateway-bench-'));
-  const configPath = join(tempDir, 'gateway.config.json');
-  await writeFile(configPath, JSON.stringify(createBenchmarkConfig(gatewayPort, mockPort), null, 2));
+  const baseUrls = [];
+  for (let index = 0; index < options.instances; index += 1) {
+    const gatewayPort = await getAvailablePort();
+    const configPath = join(tempDir, `gateway-${index}.config.json`);
+    await writeFile(configPath, JSON.stringify(createBenchmarkConfig(gatewayPort, mockPort), null, 2));
 
-  gatewayProcess = spawn(process.execPath, ['dist/index.js'], {
-    cwd: root,
-    env: {
-      ...process.env,
-      GATEWAY_CONFIG_PATH: configPath,
-      PORT: String(gatewayPort),
-      HOST: '127.0.0.1',
-      BILLING_ENABLED: 'false',
-      GATEWAY_METRICS_ENABLED: 'false',
-      PROVIDER_HEALTH_CHECK_ENABLED: 'false'
-    },
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
+    const gatewayProcess = spawn(process.execPath, ['dist/index.js'], {
+      cwd: root,
+      env: {
+        ...process.env,
+        GATEWAY_CONFIG_PATH: configPath,
+        PORT: String(gatewayPort),
+        HOST: '127.0.0.1',
+        BILLING_ENABLED: 'false',
+        GATEWAY_METRICS_ENABLED: 'false',
+        PROVIDER_HEALTH_CHECK_ENABLED: 'false'
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
 
-  const gatewayLogs = collectProcessLogs(gatewayProcess);
-  await waitForGateway(`http://127.0.0.1:${gatewayPort}/health`, gatewayProcess, gatewayLogs);
+    gatewayProcesses.push(gatewayProcess);
+    const gatewayLogs = collectProcessLogs(gatewayProcess);
+    await waitForGateway(`http://127.0.0.1:${gatewayPort}/health`, gatewayProcess, gatewayLogs);
+    baseUrls.push(`http://127.0.0.1:${gatewayPort}`);
+  }
 
-  const baseUrl = `http://127.0.0.1:${gatewayPort}`;
   const results = [];
   for (const scenario of createScenarios()) {
-    await runWarmup(baseUrl, scenario, options.warmup, options.concurrency);
-    results.push(await runBenchmark(baseUrl, scenario, options.requests, options.concurrency));
+    await runWarmup(baseUrls, scenario, options.warmup, options.concurrency);
+    results.push(await runBenchmark(baseUrls, scenario, options.requests, options.concurrency));
   }
 
   printResults(results, options);
 } finally {
-  if (gatewayProcess) {
+  for (const gatewayProcess of gatewayProcesses) {
     await stopProcess(gatewayProcess);
   }
   if (mockServer) {
@@ -71,6 +75,7 @@ function parseOptions(args) {
     requests: 200,
     concurrency: 20,
     warmup: 20,
+    instances: 1,
     skipBuild: false
   };
 
@@ -82,6 +87,10 @@ function parseOptions(args) {
       parsed.concurrency = readPositiveInteger(value, parsed.concurrency);
     } else if (name === '--warmup' && value) {
       parsed.warmup = readNonNegativeInteger(value, parsed.warmup);
+    } else if (name === '--instances' && value) {
+      parsed.instances = value === 'auto'
+        ? Math.max(1, availableParallelism())
+        : readPositiveInteger(value, parsed.instances);
     } else if (name === '--skip-build') {
       parsed.skipBuild = true;
     }
@@ -257,15 +266,15 @@ function createScenarios() {
   ];
 }
 
-async function runWarmup(baseUrl, scenario, requests, concurrency) {
+async function runWarmup(baseUrls, scenario, requests, concurrency) {
   if (requests <= 0) {
     return;
   }
 
-  await runBenchmark(baseUrl, scenario, requests, Math.min(concurrency, requests), false);
+  await runBenchmark(baseUrls, scenario, requests, Math.min(concurrency, requests), false);
 }
 
-async function runBenchmark(baseUrl, scenario, requests, concurrency, collect = true) {
+async function runBenchmark(baseUrls, scenario, requests, concurrency, collect = true) {
   const latencies = [];
   let next = 0;
   const startedAt = performance.now();
@@ -280,7 +289,7 @@ async function runBenchmark(baseUrl, scenario, requests, concurrency, collect = 
       }
 
       const requestStartedAt = performance.now();
-      await sendScenarioRequest(baseUrl, scenario);
+      await sendScenarioRequest(baseUrls[index % baseUrls.length], scenario);
       if (collect) {
         latencies.push(performance.now() - requestStartedAt);
       }
@@ -340,7 +349,7 @@ async function sendScenarioRequest(baseUrl, scenario) {
 
 function printResults(results, options) {
   console.log('');
-  console.log(`Gateway server benchmark: requests=${options.requests}, concurrency=${options.concurrency}, warmup=${options.warmup}`);
+  console.log(`Gateway server benchmark: requests=${options.requests}, concurrency=${options.concurrency}, warmup=${options.warmup}, instances=${options.instances}`);
   console.log('');
   console.log('| Scenario | req/s | mean ms | p50 ms | p95 ms | p99 ms | min ms | max ms |');
   console.log('|---|---:|---:|---:|---:|---:|---:|---:|');
