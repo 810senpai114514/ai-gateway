@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { PassThrough, Readable } from 'node:stream';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { GatewayConfig } from '../types';
 import { isObject, readHeader } from '../utils';
@@ -157,23 +158,136 @@ export function registerGatewayIdempotencyHooks(
     }
 
     const cached = buildCachedResponse(reply, payload, config);
-    if (!cached) {
-      idempotencyStore.delete(context.key);
-      entry.resolve(undefined);
+    if (cached) {
+      completePendingIdempotencyEntry(context, entry, cached);
+      reply.header('x-gateway-idempotency-status', 'stored');
       return payload;
+    }
+
+    const cacheableStream = buildCacheableStreamResponse(reply, payload, context, entry, config);
+    if (cacheableStream) {
+      reply.header('x-gateway-idempotency-status', 'stored');
+      return cacheableStream;
+    }
+
+    failPendingIdempotencyEntry(context, entry);
+    return payload;
+  });
+}
+
+function completePendingIdempotencyEntry(
+  context: IdempotencyRequestContext,
+  entry: PendingIdempotencyEntry,
+  cached: CachedIdempotencyResponse
+): void {
+  const current = idempotencyStore.get(context.key);
+  if (current !== entry || current.state !== 'pending' || current.requestHash !== context.requestHash) {
+    return;
+  }
+
+  const completed: CompletedIdempotencyEntry = {
+    state: 'completed',
+    requestHash: entry.requestHash,
+    expiresAt: entry.expiresAt,
+    response: cached
+  };
+  idempotencyStore.set(context.key, completed);
+  entry.resolve(cached);
+}
+
+function failPendingIdempotencyEntry(
+  context: IdempotencyRequestContext,
+  entry: PendingIdempotencyEntry
+): void {
+  const current = idempotencyStore.get(context.key);
+  if (current !== entry || current.state !== 'pending' || current.requestHash !== context.requestHash) {
+    return;
+  }
+
+  idempotencyStore.delete(context.key);
+  entry.resolve(undefined);
+}
+
+function buildCacheableStreamResponse(
+  reply: FastifyReply,
+  payload: unknown,
+  context: IdempotencyRequestContext,
+  entry: PendingIdempotencyEntry,
+  config: GatewayConfig
+): Readable | undefined {
+  if (!isCacheableStatus(reply.statusCode, config)) {
+    return undefined;
+  }
+
+  if (isEventStreamResponse(reply)) {
+    return undefined;
+  }
+
+  if (!isReadablePayload(payload)) {
+    return undefined;
+  }
+
+  const stream = new PassThrough();
+  const chunks: Buffer[] = [];
+  const responseSnapshot = {
+    statusCode: reply.statusCode,
+    headers: sanitizeCachedHeaders(reply.getHeaders())
+  };
+  let settled = false;
+  let streamCacheable = true;
+
+  const settle = (cachedPayload: Buffer | undefined): void => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    if (!cachedPayload) {
+      failPendingIdempotencyEntry(context, entry);
+      return;
     }
 
     const completed: CompletedIdempotencyEntry = {
       state: 'completed',
       requestHash: entry.requestHash,
       expiresAt: entry.expiresAt,
-      response: cached
+      response: {
+        ...responseSnapshot,
+        payload: cachedPayload
+      }
     };
+    const current = idempotencyStore.get(context.key);
+    if (current !== entry || current.state !== 'pending' || current.requestHash !== context.requestHash) {
+      return;
+    }
+
     idempotencyStore.set(context.key, completed);
-    reply.header('x-gateway-idempotency-status', 'stored');
-    entry.resolve(cached);
-    return payload;
+    entry.resolve(completed.response);
+  };
+
+  payload.on('data', (chunk) => {
+    const buffer = normalizeStreamChunk(chunk);
+    if (buffer) {
+      chunks.push(buffer);
+      return;
+    }
+
+    streamCacheable = false;
   });
+  payload.once('end', () => {
+    settle(streamCacheable ? Buffer.concat(chunks) : undefined);
+  });
+  payload.once('error', (error) => {
+    settle(undefined);
+    stream.destroy(error instanceof Error ? error : new Error(String(error)));
+  });
+  payload.once('close', () => {
+    if (!settled && !payload.readableEnded) {
+      settle(undefined);
+    }
+  });
+
+  payload.pipe(stream);
+  return stream;
 }
 
 export function resetGatewayIdempotencyForTests(): void {
@@ -264,6 +378,43 @@ function buildCachedResponse(
     headers: sanitizeCachedHeaders(reply.getHeaders()),
     payload: Buffer.isBuffer(payload) ? Buffer.from(payload) : payload
   };
+}
+
+function isReadablePayload(payload: unknown): payload is Readable {
+  if (payload instanceof Readable) {
+    return true;
+  }
+
+  if (!isObject(payload)) {
+    return false;
+  }
+
+  const candidate = payload as {
+    pipe?: unknown;
+    on?: unknown;
+    once?: unknown;
+  };
+  return (
+    typeof candidate.pipe === 'function' &&
+    typeof candidate.on === 'function' &&
+    typeof candidate.once === 'function'
+  );
+}
+
+function normalizeStreamChunk(chunk: unknown): Buffer | undefined {
+  if (Buffer.isBuffer(chunk)) {
+    return Buffer.from(chunk);
+  }
+
+  if (typeof chunk === 'string') {
+    return Buffer.from(chunk, 'utf8');
+  }
+
+  if (chunk instanceof Uint8Array) {
+    return Buffer.from(chunk);
+  }
+
+  return undefined;
 }
 
 function isCacheableStatus(statusCode: number, config: GatewayConfig): boolean {

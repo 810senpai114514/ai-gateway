@@ -12,7 +12,7 @@ import type {
   StandardUsage,
   UpstreamRequest
 } from '../types';
-import { callUpstream, cancelResponseBodyOnAbort, readUpstreamPayload } from '../upstream/client';
+import { callUpstream, cancelResponseBody, cancelResponseBodyOnAbort, readUpstreamPayload } from '../upstream/client';
 import {
   asNumber,
   isObject,
@@ -542,6 +542,7 @@ async function dispatchOpenAIJsonUpstreamRequest(
     };
   }
 
+  await cancelResponseBody(initialUpstreamResponse.value);
   return {
     ok: true,
     upstreamRequest: retryUpstreamRequest,

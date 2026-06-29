@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseGatewayConfigFromRaw } from '../config';
@@ -133,6 +134,48 @@ describe('gateway idempotency', () => {
       expect(second.statusCode).toBe(200);
       expect(JSON.parse(first.body)).toEqual({ calls: 1 });
       expect(JSON.parse(second.body)).toEqual({ calls: 1 });
+      expect(calls).toBe(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('caches non-event-stream Readable responses after the stream completes', async () => {
+    const config = createConfig();
+    const app = Fastify({ logger: false });
+    registerGatewayIdempotencyHooks(app, config);
+    const preHandler = createGatewayIdempotencyPreHandler(config);
+    let calls = 0;
+    app.post('/v1/streamed-json', { preHandler }, async (_request, reply) => {
+      calls += 1;
+      return reply
+        .header('content-type', 'application/json')
+        .header('x-upstream-call', String(calls))
+        .send(Readable.from([JSON.stringify({ calls })]));
+    });
+    await app.ready();
+
+    try {
+      const request = {
+        method: 'POST' as const,
+        url: '/v1/streamed-json',
+        headers: {
+          'idempotency-key': 'streamed-json-key'
+        },
+        payload: {
+          prompt: 'same'
+        }
+      };
+      const first = await app.inject(request);
+      const second = await app.inject(request);
+
+      expect(first.statusCode).toBe(200);
+      expect(second.statusCode).toBe(200);
+      expect(JSON.parse(first.body)).toEqual({ calls: 1 });
+      expect(JSON.parse(second.body)).toEqual({ calls: 1 });
+      expect(first.headers['x-gateway-idempotency-status']).toBe('stored');
+      expect(second.headers['x-gateway-idempotency-status']).toBe('replayed');
+      expect(second.headers['x-upstream-call']).toBe('1');
       expect(calls).toBe(1);
     } finally {
       await app.close();

@@ -639,7 +639,7 @@ function resolveRetryDelayMs(retry: NormalizedUpstreamRetryOptions, attempt: num
   return Math.trunc(cappedDelay + Math.random() * retry.jitterMs);
 }
 
-async function cancelResponseBody(response: Response, reason?: unknown): Promise<void> {
+export async function cancelResponseBody(response: Response, reason?: unknown): Promise<void> {
   try {
     await response.body?.cancel(reason);
   } catch {

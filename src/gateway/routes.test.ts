@@ -486,6 +486,72 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('replays an idempotent passthrough JSON stream without dispatching upstream again', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          object: 'response',
+          output_text: 'passthrough cached'
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-upstream-call': '1'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig([createProviderConfig('openai-main', 'openai_responses', ['glm-5'])]);
+    config.idempotency = {
+      enabled: true,
+      headerName: 'idempotency-key',
+      ttlMs: 60000,
+      maxEntries: 100,
+      cacheErrorResponses: false
+    };
+    const app = Fastify({ logger: false });
+    registerGatewayIdempotencyHooks(app, config);
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    const request = {
+      method: 'POST' as const,
+      url: '/v1/responses',
+      headers: {
+        'content-type': 'application/json',
+        'x-target-provider': 'openai-main',
+        'idempotency-key': 'responses-passthrough-retry-key'
+      },
+      payload: {
+        model: 'glm-5',
+        input: 'hello'
+      }
+    };
+
+    try {
+      const first = await app.inject(request);
+      const second = await app.inject(request);
+
+      expect(first.statusCode).toBe(200);
+      expect(second.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(first.body)).toMatchObject({
+        output_text: 'passthrough cached'
+      });
+      expect(JSON.parse(second.body)).toMatchObject({
+        output_text: 'passthrough cached'
+      });
+      expect(first.headers['x-gateway-idempotency-status']).toBe('stored');
+      expect(second.headers['x-gateway-idempotency-status']).toBe('replayed');
+      expect(second.headers['x-upstream-call']).toBe('1');
+    } finally {
+      await app.close();
+    }
+  });
+
   it('rejects a second upstream request when provider concurrency is saturated', async () => {
     let resolveFetch!: (response: Response) => void;
     const fetchMock = vi.fn(async () => {
@@ -4366,6 +4432,7 @@ describe('gateway routes protocol conversion', () => {
   });
 
   it('forces codex oauth refresh and retries once when upstream returns 401', async () => {
+    let staleBodyCancelled = false;
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       const urlString = String(url);
       if (urlString === 'https://auth.openai.com/oauth/token') {
@@ -4387,17 +4454,15 @@ describe('gateway routes protocol conversion', () => {
 
       const headers = (init?.headers || {}) as Record<string, string>;
       if (headers.authorization === 'Bearer atk-stale') {
-        return new Response(
-          JSON.stringify({
+        return createTrackedJsonResponse(
+          {
             error: {
               message: 'You have insufficient permissions for this operation.'
             }
-          }),
-          {
-            status: 401,
-            headers: {
-              'content-type': 'application/json'
-            }
+          },
+          401,
+          () => {
+            staleBodyCancelled = true;
           }
         );
       }
@@ -4483,6 +4548,130 @@ describe('gateway routes protocol conversion', () => {
       const payload = JSON.parse(response.body);
       expect(payload.output_text).toBe('retry-success');
       expect(payload.authorization).toBe('Bearer atk-from-codex-refresh');
+      expect(staleBodyCancelled).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('cancels stale OpenAI JSON 401 response body when codex oauth retry succeeds', async () => {
+    let staleBodyCancelled = false;
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const urlString = String(url);
+      if (urlString === 'https://auth.openai.com/oauth/token') {
+        return new Response(
+          JSON.stringify({
+            access_token: 'atk-from-codex-refresh'
+          }),
+          {
+            status: 200,
+            headers: {
+              'content-type': 'application/json'
+            }
+          }
+        );
+      }
+
+      const headers = (init?.headers || {}) as Record<string, string>;
+      if (headers.authorization === 'Bearer atk-stale') {
+        return createTrackedJsonResponse(
+          {
+            error: {
+              message: 'expired token'
+            }
+          },
+          401,
+          () => {
+            staleBodyCancelled = true;
+          }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          object: 'list',
+          data: [
+            {
+              object: 'embedding',
+              embedding: [0.1, 0.2],
+              index: 0
+            }
+          ],
+          model: 'text-embedding-3-small',
+          usage: {
+            prompt_tokens: 1,
+            total_tokens: 1
+          },
+          authorization: headers.authorization
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const config = createConfig(
+      [createProviderConfig('openai-main', 'openai_responses', ['text-embedding-3-small'])],
+      [
+        {
+          key: 'openai-main-codex-oauth',
+          enabled: true,
+          providerName: 'openai-main',
+          codexOauth: {
+            enabled: true,
+            tokenEndpoint: 'https://auth.openai.com/oauth/token',
+            clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+            scope:
+              'openid profile email offline_access api.connectors.read api.connectors.invoke',
+            accessToken: {
+              from: 'request.headers.x-codex-access-token'
+            },
+            refreshToken: {
+              from: 'request.headers.x-codex-refresh-token'
+            },
+            refreshIfMissingAccessToken: true,
+            forceRefresh: false,
+            required: true,
+            timeoutMs: 3000,
+            authHeader: 'authorization',
+            authScheme: 'Bearer'
+          }
+        }
+      ]
+    );
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime(config));
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/embeddings',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main',
+          'x-codex-access-token': 'atk-stale',
+          'x-codex-refresh-token': 'rtk-from-request'
+        },
+        payload: {
+          model: 'text-embedding-3-small',
+          input: 'hello',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(staleBodyCancelled).toBe(true);
+
+      const payload = JSON.parse(response.body);
+      expect(payload.authorization).toBe('Bearer atk-from-codex-refresh');
+      expect(payload.data?.[0]?.embedding).toEqual([0.1, 0.2]);
     } finally {
       await app.close();
     }
@@ -7168,6 +7357,23 @@ function createSseResponse(chunks: string[]): Response {
       'content-type': 'text/event-stream; charset=utf-8'
     }
   });
+}
+
+function createTrackedJsonResponse(payload: unknown, status: number, onCancel: () => void): Response {
+  const response = new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      'content-type': 'application/json'
+    }
+  });
+  const cancel = response.body?.cancel.bind(response.body);
+  if (response.body && cancel) {
+    response.body.cancel = (reason?: unknown) => {
+      onCancel();
+      return cancel(reason);
+    };
+  }
+  return response;
 }
 
 function createErroringSseResponse(chunks: string[], error: Error): Response {

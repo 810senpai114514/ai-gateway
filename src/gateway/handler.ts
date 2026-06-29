@@ -26,6 +26,7 @@ import type {
 import {
   bindAbortSignalToReadable,
   callUpstream,
+  cancelResponseBody,
   cancelResponseBodyOnAbort,
   forceEventStreamHeaders,
   readUpstreamPayload,
@@ -5810,6 +5811,7 @@ async function dispatchUpstreamRequest(
     };
   }
 
+  await cancelResponseBody(initialUpstreamResponse.value);
   return {
     ok: true,
     upstreamRequest: retryUpstreamRequest,
