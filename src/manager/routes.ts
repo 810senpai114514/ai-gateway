@@ -30,7 +30,7 @@ const redactedSecretValue = '[REDACTED]';
 
 export function registerManagerRoutes(fastify: FastifyInstance, options: ManagerRouteOptions): void {
   const preHandler = async (request: FastifyRequest, reply: FastifyReply) => {
-    const authResult = authenticateManagerRequest(request);
+    const authResult = authenticateManagerRequest(request, options.config);
     if (authResult.ok) {
       return;
     }
@@ -451,18 +451,20 @@ function normalizeSecretKey(value: string): string {
 }
 
 function authenticateManagerRequest(
-  request: FastifyRequest
+  request: FastifyRequest,
+  config: GatewayConfig
 ): { ok: true } | { ok: false; statusCode: number; message: string } {
   const managerApiKey = process.env.MANAGER_API_KEY?.trim();
   if (!managerApiKey) {
-    if (isLocalIp(request.ip)) {
+    if (isLocalIp(request.ip) && isLoopbackHost(config.host) && !hasForwardedClientIpHeaders(request)) {
       return { ok: true };
     }
 
     return {
       ok: false,
       statusCode: 403,
-      message: 'MANAGER_API_KEY is not configured. Manager API only accepts localhost requests.'
+      message:
+        'MANAGER_API_KEY is not configured. Manager API only accepts direct localhost requests when the gateway listener is bound to loopback.'
     };
   }
 
@@ -545,6 +547,20 @@ function containsProviderPayload(body: Record<string, unknown>): boolean {
 function isLocalIp(ip: string): boolean {
   const normalized = ip.trim().toLowerCase();
   return normalized === '127.0.0.1' || normalized === '::1' || normalized === '::ffff:127.0.0.1';
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1' || normalized === '[::1]';
+}
+
+function hasForwardedClientIpHeaders(request: FastifyRequest): boolean {
+  return (
+    request.headers.forwarded !== undefined ||
+    request.headers['x-forwarded-for'] !== undefined ||
+    request.headers['x-real-ip'] !== undefined ||
+    request.headers['x-client-ip'] !== undefined
+  );
 }
 
 function readGatewayConfigFile(path: string): Record<string, unknown> {

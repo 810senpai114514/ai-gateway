@@ -2541,14 +2541,14 @@ function shouldRequireClientWebSearchDeclaration(
   toolName: string,
   profile: VirtualModelProfileConfig
 ): boolean {
-  return profile.execution.matchWebSearch && isVirtualWebSearchToolName(toolName);
+  return Boolean(profile.execution.matchWebSearch) && isVirtualWebSearchToolName(toolName);
 }
 
 function shouldConsumeClientWebSearchDeclaration(
   tool: unknown,
   profile: VirtualModelProfileConfig
 ): boolean {
-  return profile.execution.matchWebSearch && (isHostedWebSearchTool(tool) || isClientWebSearchFunctionTool(tool));
+  return Boolean(profile.execution.matchWebSearch) && (isHostedWebSearchTool(tool) || isClientWebSearchFunctionTool(tool));
 }
 
 function isClientWebSearchFunctionTool(tool: unknown): boolean {
@@ -5828,7 +5828,7 @@ async function callUpstreamWithFailureCapture(
   | {
       ok: false;
       stage: 'upstream_connect' | 'upstream_concurrency' | 'upstream_circuit_open';
-      status: 502 | 429 | 503;
+      status: 502 | 429 | 503 | 499;
       message: string;
       details?: unknown;
     }
@@ -7136,34 +7136,20 @@ function publishRequestFailureEventSafe(
 }
 
 function publishFailedAttemptEventSafe(
-  request: FastifyRequest,
+  _request: FastifyRequest,
   _reply: FastifyReply,
-  config: GatewayConfig,
+  _config: GatewayConfig,
   _sourceProvider: Provider,
   _sourceAdapterKey: string,
-  attempt: ProviderAttemptFailure,
-  model: string | undefined,
+  _attempt: ProviderAttemptFailure,
+  _model: string | undefined,
   _attemptSequence: number,
   _attempts: ProviderAttemptFailure[],
-  targetProviderConfig?: ProviderConfig,
+  _targetProviderConfig?: ProviderConfig,
 ) {
-  if (!config.rawTrace.enabled) {
-    return;
-  }
-
-  const rawTraceCapture = resolveAttemptRawTraceCapture(attempt);
-  if (!rawTraceCapture) {
-    return;
-  }
-
-  publishRawTraceCaptureSafe(
-    request,
-    config,
-    attempt.provider,
-    model,
-    targetProviderConfig,
-    rawTraceCapture,
-  );
+  // Raw trace capture is request-scoped and is emitted once by the final success
+  // or final failure path. Publishing an intermediate failed fallback attempt
+  // here would consume that marker and suppress the eventual request outcome.
 }
 
 function resolveLatencyMs(reply: FastifyReply): number | undefined {

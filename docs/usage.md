@@ -190,14 +190,24 @@ npm run build && npm start
 `code_tool.runCode` 现由 `toolhub` 实现，`gateway` 不再本地执行 Deno 沙箱代码。运行编排代码时需要 `toolhub` 容器内可执行 `deno`。
 
 ```bash
+export AUTH_STATIC_API_KEYS='replace-with-gateway-client-key'
+export MANAGER_API_KEY='replace-with-manager-admin-key'
+export OPENAI_API_KEY='sk-...'
+export MCP_REMOTE_KEY='replace-with-strong-mcp-key'
+export TOOLHUB_MANAGEMENT_TOKEN='replace-with-toolhub-admin-key'
+export MINIMAX_API_KEY='replace-with-minimax-api-key'
+export ANTHROPIC_API_KEY='replace-with-tool-search-provider-key'
 docker compose up --build
 ```
 
 默认行为：
 - 服务名：`gateway`
-- 端口映射：`3000:3000`
+- 端口映射：默认只绑定宿主机 `127.0.0.1:3000:3000`；如需对外监听，显式设置 `GATEWAY_BIND_ADDRESS=0.0.0.0`
 - 使用 `gateway.config.compose.json` 挂载到容器内 `/app/gateway.config.json`
-- `node_modules` 使用独立 volume：`gateway_node_modules`
+- `gateway` 使用 Dockerfile 的 `runtime` stage 和 `npm start`
+- `toolhub` 只在 compose 内部网络暴露 `3100`，不会发布到宿主机
+- 不挂载源码目录或上级 workspace；只挂载只读配置模板
+- `AUTH_STATIC_API_KEYS`、`MANAGER_API_KEY`、`MCP_REMOTE_KEY`、`TOOLHUB_MANAGEMENT_TOKEN`、`OPENAI_API_KEY`、`MINIMAX_API_KEY`、`ANTHROPIC_API_KEY` 必须显式提供，没有 `change-me` 默认值
 
 ### 远端工具热插拔（方案4：ToolHub 稳定入口）
 
@@ -207,8 +217,8 @@ docker compose up --build
 
 本仓库已提供 compose 配置：
 - `gateway/gateway.config.compose.json`：Edge 配置，只保留 `remote-toolhub`
-- `gateway/toolhub.config.compose.json`：ToolHub 配置（`toolExposureMode: "code-tool"`），暴露 `WS /mcp/ws`，默认包含 `local-http-mcp -> http://127.0.0.1:3789/mcp`
-- 父级 `../docker-compose.yml`：包含 `gateway + toolhub` 双服务编排
+- `gateway/toolhub.config.compose.json`：ToolHub 配置模板（`toolExposureMode: "code-tool"`），容器启动时用 `MCP_REMOTE_KEY` 与 `MINIMAX_API_KEY` 替换模板占位符
+- `docker-compose.yml`：包含 `gateway + toolhub` 双服务生产编排
 
 热插拔方式：
 1. 修改 `toolhub.config.compose.json` 里的 `mcpServers`（新增/删除/替换工具）
@@ -217,7 +227,7 @@ docker compose up --build
 
 鉴权注意：
 - `gateway` 侧使用环境变量 `MCP_REMOTE_KEY`
-- `toolhub.config.compose.json` 里 `mcpGateway.principals[].key` 需要与其保持一致
+- `toolhub.config.compose.json` 里 `mcpGateway.principals[].key` 使用 `__MCP_REMOTE_KEY__` 模板占位符，容器启动时渲染
 
 网络注意：
 - 在 Docker 内运行时，`127.0.0.1` 指向容器自身；如果 MCP 服务跑在宿主机，需改为 `http://host.docker.internal:3789/mcp`。
@@ -294,7 +304,7 @@ docker compose up --build
 - `PORT`：监听端口，默认 `3000`
 - `GATEWAY_CONFIG_PATH`：JSON 配置文件路径（可选）
 - `CODEX_REFRESH_TOKEN_URL_OVERRIDE`：`providerPlugins.codexOauth.tokenEndpoint` 默认值覆盖（可选；默认 `https://auth.openai.com/oauth/token`）
-- `MANAGER_API_KEY`：管理接口密钥（可选；设置后需通过 `x-manager-key` 或 `Authorization: Bearer` 访问管理接口）
+- `MANAGER_API_KEY`：管理接口密钥（建议生产环境必配；设置后需通过 `x-manager-key` 或 `Authorization: Bearer` 访问管理接口）
 - `AGENT_STORAGE_TYPE`：Agent 存储类型，支持 `memory` / `filesystem`，默认 `memory`；`filesystem` 适合本地开发，通用网关部署建议使用 `agent.external` 托管状态
 - `AGENT_STORAGE_DIR`：仅 `AGENT_STORAGE_TYPE=filesystem` 时生效的本地存储目录（默认 `<project>/.agent-data`）
 - `AGENT_EXTERNAL_ENABLED`：是否启用 agent/session 外部数据源（默认 `false`）
@@ -557,7 +567,7 @@ docker compose up --build
 - 如确需排障查看完整 secret，可在受控环境中追加 `?revealSecrets=true`。
 - 鉴权策略：
   - 配置了 `MANAGER_API_KEY`：必须携带 `x-manager-key` 或 `Authorization: Bearer <key>`。
-  - 未配置 `MANAGER_API_KEY`：仅允许本机地址访问。
+  - 未配置 `MANAGER_API_KEY`：仅允许网关监听在 `localhost` / `127.0.0.1` / `::1` 时的直接本机请求；若监听 `0.0.0.0` 或请求带有代理转发客户端 IP header，则会拒绝访问。
 
 示例：
 

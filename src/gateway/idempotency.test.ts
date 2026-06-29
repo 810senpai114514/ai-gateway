@@ -2,7 +2,7 @@ import { Readable } from 'node:stream';
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 import { parseGatewayConfigFromRaw } from '../config';
-import type { GatewayConfig } from '../types';
+import type { GatewayConfig, GatewayRequestIdentity } from '../types';
 import {
   createGatewayIdempotencyPreHandler,
   registerGatewayIdempotencyHooks,
@@ -99,6 +99,142 @@ describe('gateway idempotency', () => {
       expect(conflict.headers['x-gateway-idempotency-status']).toBe('conflict');
       expect(JSON.parse(conflict.body).error.code).toBe('idempotency_key_conflict');
       expect(calls).toBe(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('scopes cached responses by authenticated gateway identity', async () => {
+    const config = createConfig();
+    const app = Fastify({ logger: false });
+    registerGatewayIdempotencyHooks(app, config);
+    const preHandler = createGatewayIdempotencyPreHandler(config);
+    let calls = 0;
+    app.post(
+      '/v1/test',
+      {
+        preHandler: [
+          async (request) => {
+            const userId = String(request.headers['x-test-user'] || 'anonymous');
+            request.gatewayIdentity = {
+              source: 'trusted_header',
+              billingSubjectKey: `user:${userId}`,
+              userId
+            } satisfies GatewayRequestIdentity;
+          },
+          preHandler
+        ]
+      },
+      async () => {
+        calls += 1;
+        return { calls };
+      }
+    );
+    await app.ready();
+
+    try {
+      const first = await app.inject({
+        method: 'POST',
+        url: '/v1/test',
+        headers: {
+          'idempotency-key': 'shared-key',
+          'x-test-user': 'alice'
+        },
+        payload: {
+          prompt: 'same'
+        }
+      });
+      const second = await app.inject({
+        method: 'POST',
+        url: '/v1/test',
+        headers: {
+          'idempotency-key': 'shared-key',
+          'x-test-user': 'bob'
+        },
+        payload: {
+          prompt: 'same'
+        }
+      });
+      const replay = await app.inject({
+        method: 'POST',
+        url: '/v1/test',
+        headers: {
+          'idempotency-key': 'shared-key',
+          'x-test-user': 'alice'
+        },
+        payload: {
+          prompt: 'same'
+        }
+      });
+
+      expect(first.statusCode).toBe(200);
+      expect(second.statusCode).toBe(200);
+      expect(replay.statusCode).toBe(200);
+      expect(JSON.parse(first.body)).toEqual({ calls: 1 });
+      expect(JSON.parse(second.body)).toEqual({ calls: 2 });
+      expect(JSON.parse(replay.body)).toEqual({ calls: 1 });
+      expect(second.headers['x-gateway-idempotency-status']).toBe('stored');
+      expect(replay.headers['x-gateway-idempotency-status']).toBe('replayed');
+      expect(calls).toBe(2);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('scopes cached responses by SDK-compatible auth headers when auth is disabled', async () => {
+    const config = createConfig();
+    const app = Fastify({ logger: false });
+    registerGatewayIdempotencyHooks(app, config);
+    const preHandler = createGatewayIdempotencyPreHandler(config);
+    let calls = 0;
+    app.post('/v1/test', { preHandler }, async () => {
+      calls += 1;
+      return { calls };
+    });
+    await app.ready();
+
+    try {
+      const first = await app.inject({
+        method: 'POST',
+        url: '/v1/test',
+        headers: {
+          'idempotency-key': 'sdk-key',
+          'x-goog-api-key': 'token-a'
+        },
+        payload: {
+          prompt: 'same'
+        }
+      });
+      const second = await app.inject({
+        method: 'POST',
+        url: '/v1/test',
+        headers: {
+          'idempotency-key': 'sdk-key',
+          'x-goog-api-key': 'token-b'
+        },
+        payload: {
+          prompt: 'same'
+        }
+      });
+      const replay = await app.inject({
+        method: 'POST',
+        url: '/v1/test',
+        headers: {
+          'idempotency-key': 'sdk-key',
+          'x-goog-api-key': 'token-a'
+        },
+        payload: {
+          prompt: 'same'
+        }
+      });
+
+      expect(first.statusCode).toBe(200);
+      expect(second.statusCode).toBe(200);
+      expect(replay.statusCode).toBe(200);
+      expect(JSON.parse(first.body)).toEqual({ calls: 1 });
+      expect(JSON.parse(second.body)).toEqual({ calls: 2 });
+      expect(JSON.parse(replay.body)).toEqual({ calls: 1 });
+      expect(calls).toBe(2);
     } finally {
       await app.close();
     }

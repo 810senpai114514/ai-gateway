@@ -215,7 +215,8 @@ export class McpGatewayRuntime {
     }
 
     const clientIp = readClientIp(headers, fallbackClientIp);
-    const isInternalCaller = isInternalIp(clientIp, this.options.config.internalCidrs);
+    const isInternalCaller =
+      !hasForwardedClientIpHeaders(headers) && isInternalIp(clientIp, this.options.config.internalCidrs);
     const resolvedKey = principalFromApiKey ? credential : oauthAccess?.auditKey || credential;
 
     return {
@@ -780,6 +781,15 @@ function readClientIp(headers: McpGatewayHeaderBag, fallbackIp?: string): string
   }
 
   return '0.0.0.0';
+}
+
+function hasForwardedClientIpHeaders(headers: McpGatewayHeaderBag): boolean {
+  return (
+    headers.forwarded !== undefined ||
+    headers['x-forwarded-for'] !== undefined ||
+    headers['x-real-ip'] !== undefined ||
+    headers['x-client-ip'] !== undefined
+  );
 }
 
 function buildExecutionInput(

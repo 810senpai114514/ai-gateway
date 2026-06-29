@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { PassThrough, Readable } from 'node:stream';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import type { GatewayConfig } from '../types';
+import type { GatewayConfig, GatewayRequestIdentity } from '../types';
 import { isObject, readHeader } from '../utils';
 
 type CachedPayload = string | Buffer;
@@ -31,7 +31,7 @@ interface CompletedIdempotencyEntry {
 type IdempotencyEntry = PendingIdempotencyEntry | CompletedIdempotencyEntry;
 
 interface IdempotencyRequestContext {
-  key: string;
+  storeKey: string;
   requestHash: string;
   servedFromCache: boolean;
 }
@@ -42,6 +42,12 @@ const requestContexts = new WeakMap<FastifyRequest, IdempotencyRequestContext>()
 const routeSensitiveHeaders = [
   'authorization',
   'x-api-key',
+  'api-key',
+  'x-goog-api-key',
+  'x-mcp-key',
+  'x-codex-access-token',
+  'x-codex-refresh-token',
+  'x-codex-account-id',
   'x-target-provider',
   'x-target-providers',
   'x-target-model',
@@ -49,7 +55,11 @@ const routeSensitiveHeaders = [
   'x-auth-tenant-id',
   'x-auth-sub',
   'x-auth-organization-id',
-  'x-auth-plan'
+  'x-auth-plan',
+  'openai-organization',
+  'openai-project',
+  'anthropic-version',
+  'anthropic-beta'
 ];
 
 const hopByHopHeaders = new Set([
@@ -77,8 +87,9 @@ export function createGatewayIdempotencyPreHandler(config: GatewayConfig) {
       return;
     }
 
+    const storeKey = buildIdempotencyStoreKey(request, key);
     const requestHash = hashIdempotencyRequest(request, config);
-    return handleMemoryIdempotencyPrecheck(request, reply, config, key, requestHash);
+    return handleMemoryIdempotencyPrecheck(request, reply, config, storeKey, requestHash);
   };
 }
 
@@ -86,12 +97,12 @@ async function handleMemoryIdempotencyPrecheck(
   request: FastifyRequest,
   reply: FastifyReply,
   config: GatewayConfig,
-  key: string,
+  storeKey: string,
   requestHash: string
 ) {
   const now = Date.now();
   pruneIdempotencyStore(config, now);
-  const existing = idempotencyStore.get(key);
+  const existing = idempotencyStore.get(storeKey);
 
   if (existing && existing.expiresAt > now) {
     if (existing.requestHash !== requestHash) {
@@ -100,7 +111,7 @@ async function handleMemoryIdempotencyPrecheck(
 
     if (existing.state === 'completed') {
       requestContexts.set(request, {
-        key,
+        storeKey,
         requestHash,
         servedFromCache: true
       });
@@ -110,7 +121,7 @@ async function handleMemoryIdempotencyPrecheck(
     const response = await existing.promise;
     if (response) {
       requestContexts.set(request, {
-        key,
+        storeKey,
         requestHash,
         servedFromCache: true
       });
@@ -129,13 +140,13 @@ async function handleMemoryIdempotencyPrecheck(
   }
 
   if (existing) {
-    idempotencyStore.delete(key);
+    idempotencyStore.delete(storeKey);
   }
 
   const pending = createPendingEntry(requestHash, now + config.idempotency.ttlMs);
-  idempotencyStore.set(key, pending);
+  idempotencyStore.set(storeKey, pending);
   requestContexts.set(request, {
-    key,
+    storeKey,
     requestHash,
     servedFromCache: false
   });
@@ -152,7 +163,7 @@ export function registerGatewayIdempotencyHooks(
       return payload;
     }
 
-    const entry = idempotencyStore.get(context.key);
+    const entry = idempotencyStore.get(context.storeKey);
     if (!entry || entry.state !== 'pending' || entry.requestHash !== context.requestHash) {
       return payload;
     }
@@ -180,7 +191,7 @@ function completePendingIdempotencyEntry(
   entry: PendingIdempotencyEntry,
   cached: CachedIdempotencyResponse
 ): void {
-  const current = idempotencyStore.get(context.key);
+  const current = idempotencyStore.get(context.storeKey);
   if (current !== entry || current.state !== 'pending' || current.requestHash !== context.requestHash) {
     return;
   }
@@ -191,7 +202,7 @@ function completePendingIdempotencyEntry(
     expiresAt: entry.expiresAt,
     response: cached
   };
-  idempotencyStore.set(context.key, completed);
+  idempotencyStore.set(context.storeKey, completed);
   entry.resolve(cached);
 }
 
@@ -199,12 +210,12 @@ function failPendingIdempotencyEntry(
   context: IdempotencyRequestContext,
   entry: PendingIdempotencyEntry
 ): void {
-  const current = idempotencyStore.get(context.key);
+  const current = idempotencyStore.get(context.storeKey);
   if (current !== entry || current.state !== 'pending' || current.requestHash !== context.requestHash) {
     return;
   }
 
-  idempotencyStore.delete(context.key);
+  idempotencyStore.delete(context.storeKey);
   entry.resolve(undefined);
 }
 
@@ -255,12 +266,12 @@ function buildCacheableStreamResponse(
         payload: cachedPayload
       }
     };
-    const current = idempotencyStore.get(context.key);
+    const current = idempotencyStore.get(context.storeKey);
     if (current !== entry || current.state !== 'pending' || current.requestHash !== context.requestHash) {
       return;
     }
 
-    idempotencyStore.set(context.key, completed);
+    idempotencyStore.set(context.storeKey, completed);
     entry.resolve(completed.response);
   };
 
@@ -486,10 +497,26 @@ function hashIdempotencyRequest(request: FastifyRequest, config: GatewayConfig):
   hash.update('\n');
   hash.update(config.idempotency.headerName.trim().toLowerCase());
   hash.update('\n');
+  hash.update(stableStringify(normalizeGatewayIdentityForFingerprint(request.gatewayIdentity)));
+  hash.update('\n');
   hash.update(stableStringify(selectFingerprintHeaders(request)));
   hash.update('\n');
   hash.update(stableStringify(request.body));
   return hash.digest('hex');
+}
+
+function buildIdempotencyStoreKey(request: FastifyRequest, idempotencyKey: string): string {
+  const identity = request.gatewayIdentity;
+  if (identity?.billingSubjectKey) {
+    return `identity:${identity.source}:${hashStableValue(identity.billingSubjectKey)}:${idempotencyKey}`;
+  }
+
+  const fingerprintHeaders = selectFingerprintHeaders(request);
+  if (Object.keys(fingerprintHeaders).length > 0) {
+    return `headers:${hashStableValue(fingerprintHeaders)}:${idempotencyKey}`;
+  }
+
+  return `anonymous:${idempotencyKey}`;
 }
 
 function selectFingerprintHeaders(request: FastifyRequest): Record<string, string | string[]> {
@@ -506,8 +533,34 @@ function selectFingerprintHeaders(request: FastifyRequest): Record<string, strin
   return selected;
 }
 
+function normalizeGatewayIdentityForFingerprint(
+  identity: GatewayRequestIdentity | undefined
+): Record<string, string> | undefined {
+  if (!identity) {
+    return undefined;
+  }
+
+  const normalized: Record<string, string> = {
+    source: identity.source,
+    billingSubjectKey: identity.billingSubjectKey
+  };
+
+  for (const key of ['userId', 'tenantId', 'subject', 'organizationId', 'plan', 'apiKeyId'] as const) {
+    const value = identity[key];
+    if (typeof value === 'string') {
+      normalized[key] = value;
+    }
+  }
+
+  return normalized;
+}
+
+function hashStableValue(value: unknown): string {
+  return createHash('sha256').update(stableStringify(value)).digest('hex');
+}
+
 function stableStringify(value: unknown): string {
-  return JSON.stringify(sortStable(value));
+  return JSON.stringify(sortStable(value)) ?? 'undefined';
 }
 
 function sortStable(value: unknown): unknown {

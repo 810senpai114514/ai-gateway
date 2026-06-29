@@ -5,7 +5,7 @@
     {
       "name": "openai-main",
       "type": "openai_chat_completions",
-      "apikey": "sk-your-openai-key",
+      "apiKeyEnv": "OPENAI_API_KEY",
       "baseurl": "https://api.openai.com/v1",
       "models": ["gpt-4.1-mini"]
     }

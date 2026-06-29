@@ -1773,6 +1773,99 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('stores final fallback success in raw trace instead of the failed attempt', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.startsWith('https://primary.example/v1/')) {
+        return new Response(JSON.stringify({ error: { message: 'primary failed' } }), {
+          status: 500,
+          headers: {
+            'content-type': 'application/json'
+          }
+        });
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_fallback_trace',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'fallback success'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            total_tokens: 5
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const primary = createProviderConfig('openai-primary', 'openai_chat_completions', ['glm-5']);
+    primary.baseurl = 'https://primary.example/v1';
+    const backup = createProviderConfig('openai-backup', 'openai_chat_completions', ['glm-5']);
+    backup.baseurl = 'https://backup.example/v1';
+    const spoolDir = await mkdtemp(join(tmpdir(), 'gateway-raw-trace-fallback-'));
+    const config = createConfig([primary, backup]);
+    config.rawTrace = {
+      ...config.rawTrace,
+      enabled: true,
+      mode: 'body_full',
+      spoolDir
+    };
+    await initializeRawTraceManager(config.rawTrace);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(app, config, createGatewayRuntime());
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-providers': 'openai-primary,openai-backup'
+        },
+        payload: {
+          model: 'glm-5',
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['x-gateway-fallback-used']).toBe('true');
+      expect(response.headers['x-gateway-target-provider-name']).toBe('openai-backup');
+
+      const { bundleDir, manifest } = await waitForRawTraceManifest(spoolDir);
+      await closeRawTraceManager();
+      expect(manifest.target?.providerName).toBe('openai-backup');
+
+      const upstreamMetadata = JSON.parse(await readFile(join(bundleDir, 'upstream_request_metadata.json'), 'utf8'));
+      expect(upstreamMetadata.url).toBe('/v1/chat/completions');
+      const upstreamResponse = await readFile(join(bundleDir, 'upstream_response.json'), 'utf8');
+      expect(upstreamResponse).toContain('fallback success');
+      expect(upstreamResponse).not.toContain('primary failed');
+    } finally {
+      await closeRawTraceManager();
+      await app.close();
+      await rm(spoolDir, { recursive: true, force: true });
+    }
+  });
+
   it('streams chat/completions reasoning_content as Responses reasoning_text events', async () => {
     const fetchMock = vi.fn(async () => {
       return createSseResponse([
@@ -7396,7 +7489,15 @@ function createErroringSseResponse(chunks: string[], error: Error): Response {
 
 async function waitForRawTraceManifest(
   spoolDir: string,
-): Promise<{ bundleDir: string; manifest: { parts: Array<{ partType: string }> } }> {
+): Promise<{
+  bundleDir: string;
+  manifest: {
+    target?: {
+      providerName?: string;
+    };
+    parts: Array<{ partType: string }>;
+  };
+}> {
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const bundles = await readdir(spoolDir);
     for (const bundle of bundles) {

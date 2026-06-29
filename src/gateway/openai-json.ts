@@ -559,7 +559,7 @@ async function callOpenAIJsonUpstream(
   | {
       ok: false;
       stage: 'upstream_connect' | 'upstream_concurrency' | 'upstream_circuit_open';
-      status: 502 | 429 | 503;
+      status: 502 | 429 | 503 | 499;
       message: string;
       details?: unknown;
     }

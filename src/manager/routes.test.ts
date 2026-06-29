@@ -348,7 +348,7 @@ describe('manager config routes', () => {
         'host/port updated in file, but listener address will take effect after process restart.'
       );
       expect(JSON.parse(readFileSync(setup.configPath, 'utf8'))).toEqual(initialConfig);
-      expect(runtimeConfig.host).toBe('0.0.0.0');
+      expect(runtimeConfig.host).toBe('127.0.0.1');
       expect(runtimeConfig.port).toBe(3000);
       expect(beforeApplyConfig).not.toHaveBeenCalled();
       expect(onConfigReload).not.toHaveBeenCalled();
@@ -391,6 +391,54 @@ describe('manager config routes', () => {
         }
       });
       expect(allowed.statusCode).toBe(200);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('requires manager api key when the listener is not bound to loopback', async () => {
+    const setup = prepareTempConfig({});
+    tempDir = setup.tempDir;
+    process.env.GATEWAY_CONFIG_PATH = setup.configPath;
+    delete process.env.MANAGER_API_KEY;
+
+    const app = Fastify({ logger: false });
+    registerManagerRoutes(app, { config: createRuntimeConfig({ host: '0.0.0.0' }) });
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/manager/config'
+      });
+
+      expect(response.statusCode).toBe(403);
+      expect(JSON.parse(response.body).error.message).toContain('MANAGER_API_KEY is not configured');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('rejects forwarded localhost manager requests when no api key is configured', async () => {
+    const setup = prepareTempConfig({});
+    tempDir = setup.tempDir;
+    process.env.GATEWAY_CONFIG_PATH = setup.configPath;
+    delete process.env.MANAGER_API_KEY;
+
+    const app = Fastify({ logger: false });
+    registerManagerRoutes(app, { config: createRuntimeConfig() });
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/manager/config',
+        headers: {
+          'x-forwarded-for': '203.0.113.10'
+        }
+      });
+
+      expect(response.statusCode).toBe(403);
     } finally {
       await app.close();
     }
@@ -673,9 +721,9 @@ function prepareTempConfig(payload: Record<string, unknown>): { tempDir: string;
   };
 }
 
-function createRuntimeConfig(): GatewayConfig {
-  return {
-    host: '0.0.0.0',
+function createRuntimeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
+  const config = {
+    host: '127.0.0.1',
     port: 3000,
     providers: [],
     defaultTargetProvider: 'openai',
@@ -835,6 +883,11 @@ function createRuntimeConfig(): GatewayConfig {
       }
     }
   } as unknown as GatewayConfig;
+
+  return {
+    ...config,
+    ...overrides
+  };
 }
 
 function createProviderConfig(

@@ -276,6 +276,25 @@ describe('mcp gateway oauth runtime', () => {
     expect(auth.context?.isInternalCaller).toBe(false);
   });
 
+  it('treats forwarded loopback socket requests as external callers', () => {
+    const runtime = createMcpGatewayRuntime({
+      config: createConfig(),
+      servers: []
+    });
+
+    const auth = runtime.authenticateSocket(
+      {
+        'x-api-key': 'mcp-test-key',
+        'x-forwarded-for': '203.0.113.10'
+      },
+      '127.0.0.1'
+    );
+
+    expect(auth.ok).toBe(true);
+    expect(auth.context?.clientIp).toBe('127.0.0.1');
+    expect(auth.context?.isInternalCaller).toBe(false);
+  });
+
   it('exposes codex-compatible oauth discovery paths', () => {
     const runtime = createMcpGatewayRuntime({
       config: createConfig(),

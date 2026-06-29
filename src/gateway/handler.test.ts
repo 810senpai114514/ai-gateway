@@ -269,7 +269,7 @@ describe('resolveBillingResponseSnapshot', () => {
         },
         finish_reason: 'stop'
       }
-    ) as AsyncIterable<string | Buffer>;
+    ) as unknown as AsyncIterable<string | Buffer>;
 
     let body = '';
     for await (const chunk of stream) {
@@ -413,7 +413,7 @@ describe('resolveBillingResponseSnapshot', () => {
         },
         finish_reason: 'stop'
       }
-    ) as AsyncIterable<string | Buffer>;
+    ) as unknown as AsyncIterable<string | Buffer>;
 
     let body = '';
     for await (const chunk of stream) {

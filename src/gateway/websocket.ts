@@ -53,6 +53,7 @@ const blockedForwardHeaderSet = new Set([
 
 const internalGatewayQueryParamSet = new Set(['source_adapter', 'source']);
 const codexDefaultInstructions = 'You are a helpful assistant.';
+const pendingDownstreamMessageLimit = 16;
 type WebSocketPayload = RawData | string;
 
 export function registerGatewayResponsesWebSocketRoute(
@@ -60,7 +61,8 @@ export function registerGatewayResponsesWebSocketRoute(
   config: GatewayConfig,
   runtime?: Pick<GatewayRuntime, 'providerPlugins'>
 ): void {
-  const websocketServer = new WebSocketServer({ noServer: true });
+  const maxPayload = resolveGatewayWebSocketMaxPayloadBytes(config);
+  const websocketServer = new WebSocketServer({ noServer: true, maxPayload });
   const socketContext = new WeakMap<WebSocket, GatewaySocketContext>();
 
   const onUpgrade = (request: IncomingMessage, socket: Socket, head: Buffer): void => {
@@ -175,7 +177,8 @@ export function registerGatewayResponsesWebSocketRoute(
 
       const normalizedWebSocketUrl = normalizeUrlForWebSocket(upstreamRequestResult.value.url);
       upstreamSocket = new WebSocket(normalizedWebSocketUrl, {
-        headers: upstreamRequestResult.value.headers
+        headers: upstreamRequestResult.value.headers,
+        maxPayload: resolveGatewayWebSocketMaxPayloadBytes(config)
       });
     } catch (error) {
       downstreamSocket.close(1011, `Failed to init upstream websocket: ${toErrorMessage(error)}`);
@@ -204,7 +207,13 @@ function bindSocketRelay(
   context: GatewaySocketContext,
   config: GatewayConfig
 ): void {
-  const pendingDownstreamMessages: Array<{ payload: WebSocketPayload; binary: boolean }> = [];
+  const pendingDownstreamMessages: Array<{
+    payload: WebSocketPayload;
+    binary: boolean;
+    byteLength: number;
+  }> = [];
+  const pendingDownstreamByteLimit = resolveGatewayWebSocketMaxPayloadBytes(config);
+  let pendingDownstreamBytes = 0;
   let pendingUpstreamToDownstreamSends = 0;
   let upstreamCloseForceTimer: NodeJS.Timeout | undefined;
   let upstreamClosePending:
@@ -263,6 +272,7 @@ function bindSocketRelay(
         return;
       }
 
+      pendingDownstreamBytes = Math.max(0, pendingDownstreamBytes - next.byteLength);
       sendMessageToUpstream(next.payload, next.binary);
     }
   };
@@ -281,7 +291,21 @@ function bindSocketRelay(
     }
 
     if (upstreamSocket.readyState === WebSocket.CONNECTING) {
-      pendingDownstreamMessages.push(messageForUpstream);
+      const byteLength = webSocketPayloadByteLength(messageForUpstream.payload);
+      if (
+        pendingDownstreamMessages.length >= pendingDownstreamMessageLimit ||
+        pendingDownstreamBytes + byteLength > pendingDownstreamByteLimit
+      ) {
+        closePeer(downstreamSocket, 1013, 'Gateway websocket upstream connection is not ready.');
+        closePeer(upstreamSocket, 1013, 'Gateway websocket upstream connection is not ready.');
+        return;
+      }
+
+      pendingDownstreamMessages.push({
+        ...messageForUpstream,
+        byteLength
+      });
+      pendingDownstreamBytes += byteLength;
       return;
     }
 
@@ -773,6 +797,34 @@ function readSourceAdapterHintFromRequestUrl(url: URL): GatewayCodexWsSourceAdap
   }
 
   return parseGatewayCodexWsSourceAdapterKey(url.searchParams.get('source') || undefined);
+}
+
+function resolveGatewayWebSocketMaxPayloadBytes(config: GatewayConfig): number {
+  if (Number.isFinite(config.bodyLimitBytes) && config.bodyLimitBytes > 0) {
+    return Math.max(1024, Math.floor(config.bodyLimitBytes));
+  }
+
+  return 1024 * 1024;
+}
+
+function webSocketPayloadByteLength(payload: WebSocketPayload): number {
+  if (typeof payload === 'string') {
+    return Buffer.byteLength(payload, 'utf8');
+  }
+
+  if (Buffer.isBuffer(payload)) {
+    return payload.byteLength;
+  }
+
+  if (Array.isArray(payload)) {
+    return payload.reduce((total, item) => total + webSocketPayloadByteLength(item), 0);
+  }
+
+  if (payload instanceof ArrayBuffer) {
+    return payload.byteLength;
+  }
+
+  return 0;
 }
 
 function rawDataToUtf8String(rawData: RawData): string {

@@ -11,6 +11,9 @@ import {
 import { readHeader } from '../utils';
 import { McpGatewayError, type McpGatewayPrincipalContext, type McpGatewayRuntime } from './runtime';
 
+const mcpGatewayWebSocketMaxPayloadBytes = 1024 * 1024;
+const mcpGatewayWebSocketMaxInFlightMessages = 16;
+
 export function registerMcpGatewayWebSocketRoute(
   fastify: FastifyInstance,
   runtime: McpGatewayRuntime
@@ -19,7 +22,10 @@ export function registerMcpGatewayWebSocketRoute(
     return;
   }
 
-  const websocketServer = new WebSocketServer({ noServer: true });
+  const websocketServer = new WebSocketServer({
+    noServer: true,
+    maxPayload: mcpGatewayWebSocketMaxPayloadBytes
+  });
   const contextBySocket = new WeakMap<WebSocket, McpGatewayPrincipalContext>();
 
   const onUpgrade = (request: IncomingMessage, socket: Socket, head: Buffer): void => {
@@ -75,8 +81,17 @@ export function registerMcpGatewayWebSocketRoute(
       return;
     }
 
-    socket.on('message', async (raw) => {
-      await handleMessage(runtime, socket, context, raw);
+    let inFlightMessages = 0;
+    socket.on('message', (raw) => {
+      if (inFlightMessages >= mcpGatewayWebSocketMaxInFlightMessages) {
+        socket.close(1013, 'Too many pending MCP messages.');
+        return;
+      }
+
+      inFlightMessages += 1;
+      void handleMessage(runtime, socket, context, raw).finally(() => {
+        inFlightMessages = Math.max(0, inFlightMessages - 1);
+      });
     });
 
     socket.on('error', (error) => {
@@ -147,6 +162,13 @@ async function handleMessage(
 }
 
 function parseMessagePayload(rawData: RawData): { ok: true; body: unknown } | { ok: false; error: string } {
+  if (rawDataByteLength(rawData) > mcpGatewayWebSocketMaxPayloadBytes) {
+    return {
+      ok: false,
+      error: 'JSON-RPC payload exceeds MCP WebSocket message limit.'
+    };
+  }
+
   const text = rawToString(rawData);
   try {
     return {
@@ -175,6 +197,26 @@ function rawToString(rawData: RawData): string {
   }
 
   return Buffer.from(rawData).toString('utf8');
+}
+
+function rawDataByteLength(rawData: RawData): number {
+  if (typeof rawData === 'string') {
+    return Buffer.byteLength(rawData, 'utf8');
+  }
+
+  if (Buffer.isBuffer(rawData)) {
+    return rawData.byteLength;
+  }
+
+  if (Array.isArray(rawData)) {
+    return rawData.reduce((total, item) => total + rawDataByteLength(item), 0);
+  }
+
+  if (rawData instanceof ArrayBuffer) {
+    return rawData.byteLength;
+  }
+
+  return 0;
 }
 
 function sendJson(socket: WebSocket, payload: Record<string, unknown>): void {

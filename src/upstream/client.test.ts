@@ -206,7 +206,7 @@ describe('upstream response abort handling', () => {
     const error = await pending;
 
     expect(error).toBeInstanceOf(Error);
-    expect(error.message).toBe('client disconnected');
+    expect((error as Error).message).toBe('client disconnected');
   });
 
   it('cancels an upstream response body when the client abort signal fires', async () => {

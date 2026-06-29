@@ -15,7 +15,7 @@
         "minimax-coding-plan-mcp"
       ],
       "env": {
-        "MINIMAX_API_KEY": "replace-with-minimax-api-key",
+        "MINIMAX_API_KEY": "__MINIMAX_API_KEY__",
         "MINIMAX_API_HOST": "https://api.minimaxi.com"
       }
     }
@@ -33,7 +33,7 @@
     },
     "principals": [
       {
-        "key": "change-me-mcp-remote-key",
+        "key": "__MCP_REMOTE_KEY__",
         "team": "edge-gateway",
         "allowServers": [
           "*"

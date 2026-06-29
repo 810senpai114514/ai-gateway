@@ -158,7 +158,7 @@ export function normalizeNamespacedToolName(
   return `${trimmedNamespace}.${trimmedName}`;
 }
 
-export function isOpenAIWebSearchTool(tool: unknown): tool is Record<string, unknown> {
+export function isOpenAIWebSearchTool(tool: unknown): boolean {
   if (!isObject(tool)) {
     return false;
   }
@@ -167,7 +167,7 @@ export function isOpenAIWebSearchTool(tool: unknown): tool is Record<string, unk
   return type === 'web_search' || type === 'web_search_preview';
 }
 
-export function isAnthropicWebSearchTool(tool: unknown): tool is Record<string, unknown> {
+export function isAnthropicWebSearchTool(tool: unknown): boolean {
   if (!isObject(tool)) {
     return false;
   }

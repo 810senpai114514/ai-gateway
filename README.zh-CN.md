@@ -21,6 +21,13 @@ npm start
 Docker Compose：
 
 ```bash
+export AUTH_STATIC_API_KEYS='replace-with-gateway-client-key'
+export MANAGER_API_KEY='replace-with-manager-admin-key'
+export OPENAI_API_KEY='sk-...'
+export MCP_REMOTE_KEY='replace-with-strong-mcp-key'
+export TOOLHUB_MANAGEMENT_TOKEN='replace-with-toolhub-admin-key'
+export MINIMAX_API_KEY='replace-with-minimax-api-key'
+export ANTHROPIC_API_KEY='replace-with-tool-search-provider-key'
 docker compose up --build
 ```
 

@@ -14,6 +14,8 @@
     "release": "node scripts/release.mjs",
     "test:sdk:responses": "node scripts/test-openai-responses-sdk.mjs",
     "test": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.build.json",
+    "typecheck:all": "tsc --noEmit -p tsconfig.json",
     "bench": "vitest bench",
     "bench:server": "node scripts/benchmark-gateway-server.mjs",
     "test:coverage": "vitest --coverage"
@@ -51,6 +53,7 @@
     "@types/glob": "^8.1.0",
     "@types/node": "^25.3.5",
     "@types/ws": "^8.18.1",
+    "@vitest/coverage-v8": "^4.1.9",
     "esbuild": "^0.28.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",
