@@ -105,6 +105,33 @@ export function buildGeminiUrl(
   return ok(q ? `${path}?${q}` : path);
 }
 
+export function buildGeminiInteractionsUrl(
+  request: FastifyRequest,
+  apiVersion: string,
+  config: GatewayConfig
+): Result<string> {
+  const incomingUrl = new URL(request.url, 'http://gateway.local');
+  const incomingQuery = new URLSearchParams(incomingUrl.search);
+  const query = new URLSearchParams();
+
+  const keyFromQuery = incomingQuery.get('key');
+  const key = keyFromQuery || config.geminiApiKey || process.env.GEMINI_API_KEY;
+  if (!key) {
+    return err('GEMINI_API_KEY is missing.');
+  }
+
+  for (const [name, value] of incomingQuery.entries()) {
+    if (geminiPassthroughQueryParams.has(name)) {
+      query.set(name, value);
+    }
+  }
+  query.set('key', key);
+
+  const path = `${config.geminiBaseUrl}/${apiVersion}/interactions`;
+  const q = query.toString();
+  return ok(q ? `${path}?${q}` : path);
+}
+
 export function mapFinishReasonToOpenAI(reason?: string): string {
   if (!reason) {
     return 'stop';

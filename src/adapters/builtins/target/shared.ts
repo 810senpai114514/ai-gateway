@@ -133,6 +133,10 @@ export function parseGeminiToStandardResponse(payload: unknown): Result<Standard
     return err('Invalid Gemini response payload.');
   }
 
+  if (payload.object === 'interaction' || Array.isArray(payload.steps)) {
+    return parseGeminiInteractionToStandardResponse(payload);
+  }
+
   const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
   const first = isObject(candidates[0]) ? candidates[0] : undefined;
   const content = isObject(first?.content) ? first.content : undefined;
@@ -164,6 +168,35 @@ export function parseGeminiToStandardResponse(payload: unknown): Result<Standard
   }));
 }
 
+function parseGeminiInteractionToStandardResponse(payload: Record<string, unknown>): Result<StandardResponse> {
+  const steps = Array.isArray(payload.steps) ? payload.steps : [];
+  const outputText = extractGeminiInteractionOutputText(steps);
+  const toolCalls = extractGeminiInteractionFunctionCalls(steps);
+  const reasoningItems = extractGeminiInteractionReasoningItems(steps);
+
+  if (!outputText && toolCalls.length === 0 && reasoningItems.length === 0) {
+    return err('Gemini interaction response does not contain text output, reasoning output, or tool calls.');
+  }
+
+  const usageRaw = isObject(payload.usage) ? payload.usage : undefined;
+  const usage: StandardUsage = {
+    input_tokens: asNumber(usageRaw?.total_input_tokens),
+    output_tokens: asNumber(usageRaw?.total_output_tokens),
+    total_tokens: asNumber(usageRaw?.total_tokens),
+    cache_read_tokens: asNumber(usageRaw?.total_cached_tokens)
+  };
+
+  const status = asString(payload.status);
+  return ok(createStandardResponse({
+    id: asString(payload.id) || `gemini_interaction_${randomUUID().replace(/-/g, '')}`,
+    model: asString(payload.model) || asString(payload.agent) || 'unknown',
+    outputText,
+    outputItems: buildStandardResponseOutputItems(outputText, toolCalls, reasoningItems),
+    usage,
+    finishReason: toolCalls.length > 0 ? 'tool_use' : mapGeminiInteractionStatusToFinishReason(status)
+  }));
+}
+
 function createStandardResponse(args: {
   id: string;
   model: string;
@@ -186,6 +219,158 @@ function createStandardResponse(args: {
     usage: args.usage,
     finish_reason: args.finishReason
   };
+}
+
+function extractGeminiInteractionOutputText(steps: unknown[]): string {
+  const chunks: string[] = [];
+  for (const step of steps) {
+    if (!isObject(step) || asString(step.type) !== 'model_output') {
+      continue;
+    }
+
+    const content = Array.isArray(step.content) ? step.content : [];
+    for (const item of content) {
+      const text = extractTextFromPart(item);
+      if (text) {
+        chunks.push(text);
+      }
+    }
+  }
+
+  return chunks.join('\n').trim();
+}
+
+function extractGeminiInteractionFunctionCalls(steps: unknown[]): StandardResponseFunctionCall[] {
+  const toolCalls: StandardResponseFunctionCall[] = [];
+  for (const step of steps) {
+    if (!isObject(step) || asString(step.type) !== 'function_call') {
+      continue;
+    }
+
+    const name = asString(step.name);
+    if (!name) {
+      continue;
+    }
+
+    const id = asString(step.id) || asString(step.call_id) || `gemini_call_${randomUUID().replace(/-/g, '')}`;
+    toolCalls.push({
+      id,
+      type: 'function_call',
+      call_id: id,
+      name,
+      arguments: normalizeFunctionCallArguments(step.arguments),
+      status: 'completed'
+    });
+  }
+
+  return toolCalls;
+}
+
+function extractGeminiInteractionReasoningItems(steps: unknown[]): StandardResponseReasoning[] {
+  const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
+  const reasoningSummary: NonNullable<StandardResponseReasoning['summary']> = [];
+  const reasoningDetails: unknown[] = [];
+  let encryptedContent: string | undefined;
+
+  for (const step of steps) {
+    if (!isObject(step) || asString(step.type) !== 'thought') {
+      continue;
+    }
+
+    const summary =
+      extractGeminiInteractionThoughtSummary(step.summary) ||
+      extractGeminiInteractionThoughtSummary(step.thought_summary);
+    if (summary) {
+      reasoningSummary.push({
+        type: 'summary_text',
+        text: summary
+      });
+      reasoningDetails.push({
+        type: 'reasoning.summary',
+        summary,
+        format: 'google-interactions-v1'
+      });
+    }
+
+    const text = asString(step.text) || asString(step.thought);
+    if (text) {
+      reasoningContent.push({
+        type: 'reasoning_text',
+        text
+      });
+      reasoningDetails.push({
+        type: 'reasoning.text',
+        text,
+        format: 'google-interactions-v1'
+      });
+    }
+
+    const signature = asString(step.signature);
+    if (signature) {
+      encryptedContent = encryptedContent || signature;
+      reasoningDetails.push({
+        type: 'reasoning.encrypted',
+        data: signature,
+        format: 'google-interactions-v1'
+      });
+    }
+  }
+
+  if (
+    reasoningContent.length === 0 &&
+    reasoningSummary.length === 0 &&
+    reasoningDetails.length === 0 &&
+    !encryptedContent
+  ) {
+    return [];
+  }
+
+  const reasoning: StandardResponseReasoning = {
+    id: `rs_${randomUUID().replace(/-/g, '')}`,
+    type: 'reasoning',
+    status: 'completed',
+    summary: reasoningSummary
+  };
+  if (reasoningContent.length > 0) {
+    reasoning.content = reasoningContent;
+  }
+  if (encryptedContent) {
+    reasoning.encrypted_content = encryptedContent;
+  }
+  if (reasoningDetails.length > 0) {
+    reasoning.reasoning_details = reasoningDetails;
+  }
+
+  return [reasoning];
+}
+
+function extractGeminiInteractionThoughtSummary(value: unknown): string {
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  const items = Array.isArray(value) ? value : value !== undefined ? [value] : [];
+  return items
+    .map((item) => extractTextFromPart(item))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function mapGeminiInteractionStatusToFinishReason(status?: string): string | undefined {
+  if (!status) {
+    return undefined;
+  }
+
+  if (status === 'incomplete' || status === 'budget_exceeded') {
+    return 'length';
+  }
+
+  if (status === 'requires_action') {
+    return 'tool_use';
+  }
+
+  return status;
 }
 
 function normalizeServerToolUse(value: Record<string, unknown> | undefined): StandardUsage['server_tool_use'] {

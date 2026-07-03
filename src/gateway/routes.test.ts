@@ -3062,6 +3062,835 @@ describe('gateway routes protocol conversion', () => {
     }
   });
 
+  it('converts OpenAI Responses requests to Gemini Interactions targets', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'int_nonstream_1',
+          object: 'interaction',
+          status: 'completed',
+          model: 'gemini-2.5-flash',
+          steps: [
+            {
+              type: 'model_output',
+              content: [{ type: 'text', text: 'hello from interactions' }]
+            }
+          ],
+          usage: {
+            total_input_tokens: 3,
+            total_output_tokens: 2,
+            total_tokens: 5,
+            total_cached_tokens: 1
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemini-2.5-flash'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main'
+        },
+        payload: {
+          model: 'gemini-2.5-flash',
+          instructions: 'Be terse.',
+          input: 'hello',
+          temperature: 0.2
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://generativelanguage.googleapis.com/v1beta/interactions?key=gemini-test-key');
+      expect(JSON.parse(String(upstreamInit.body))).toEqual({
+        model: 'gemini-2.5-flash',
+        input: 'hello',
+        system_instruction: 'Be terse.',
+        generation_config: {
+          temperature: 0.2
+        }
+      });
+
+      const body = JSON.parse(response.body);
+      expect(body).toMatchObject({
+        id: 'int_nonstream_1',
+        object: 'response',
+        model: 'gemini-2.5-flash',
+        output_text: 'hello from interactions',
+        usage: {
+          input_tokens: 3,
+          output_tokens: 2,
+          total_tokens: 5
+        }
+      });
+      expect(body.usage.input_tokens_details.cached_tokens).toBe(1);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('maps OpenAI Responses reasoning history to Gemini Interactions thought summary arrays', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'int_reasoning_1',
+          object: 'interaction',
+          status: 'completed',
+          model: 'gemini-2.5-flash',
+          steps: [
+            {
+              type: 'model_output',
+              content: [{ type: 'text', text: 'ok' }]
+            }
+          ]
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemini-2.5-flash'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main'
+        },
+        payload: {
+          model: 'gemini-2.5-flash',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: 'Use a weather tool.'
+            },
+            {
+              type: 'reasoning',
+              summary: [
+                {
+                  type: 'summary_text',
+                  text: 'Need weather data.'
+                }
+              ],
+              content: [
+                {
+                  type: 'reasoning_text',
+                  text: 'Check current weather.'
+                }
+              ]
+            },
+            {
+              type: 'function_call',
+              call_id: 'call_weather',
+              name: 'get_weather',
+              arguments: '{"city":"Shanghai"}'
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody.input).toEqual([
+        {
+          type: 'user_input',
+          content: [{ type: 'text', text: 'Use a weather tool.' }]
+        },
+        {
+          type: 'thought',
+          summary: [{ type: 'text', text: 'Check current weather.\nNeed weather data.' }]
+        },
+        {
+          type: 'function_call',
+          id: 'call_weather',
+          name: 'get_weather',
+          arguments: {
+            city: 'Shanghai'
+          }
+        }
+      ]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('collects Gemini Interactions event streams for non-stream Anthropic responses', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: interaction.created\ndata: {"event_type":"interaction.created","interaction":{"id":"int_anthropic_sse_1","object":"interaction","status":"in_progress","model":"gemma-4-31b-it"}}\n\n',
+        'event: step.start\ndata: {"event_type":"step.start","index":0,"step":{"type":"model_output"}}\n\n',
+        'event: step.delta\ndata: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"hello "}}\n\n',
+        'event: step.delta\ndata: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"from interactions"}}\n\n',
+        'event: step.stop\ndata: {"event_type":"step.stop","index":0}\n\n',
+        'event: interaction.completed\ndata: {"event_type":"interaction.completed","interaction":{"id":"int_anthropic_sse_1","object":"interaction","status":"completed","model":"gemma-4-31b-it","usage":{"total_input_tokens":6,"total_output_tokens":3,"total_tokens":9}}}\n\n',
+        'event: done\ndata: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemma-4-31b-it'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main',
+          'anthropic-version': '2023-06-01',
+          'x-api-key': 'test-key'
+        },
+        payload: {
+          model: 'gemma-4-31b-it',
+          max_tokens: 64,
+          messages: [
+            {
+              role: 'user',
+              content: 'hello'
+            }
+          ]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://generativelanguage.googleapis.com/v1beta/interactions?key=gemini-test-key');
+      expect(JSON.parse(String(upstreamInit.body))).toEqual({
+        model: 'gemma-4-31b-it',
+        input: [
+          {
+            type: 'user_input',
+            content: [{ type: 'text', text: 'hello' }]
+          }
+        ],
+        generation_config: {
+          max_output_tokens: 64
+        }
+      });
+
+      const body = JSON.parse(response.body);
+      expect(body).toMatchObject({
+        id: 'int_anthropic_sse_1',
+        type: 'message',
+        role: 'assistant',
+        model: 'gemma-4-31b-it',
+        content: [{ type: 'text', text: 'hello from interactions' }],
+        stop_reason: 'end_turn',
+        usage: {
+          input_tokens: 6,
+          output_tokens: 3
+        }
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('streams Gemini Interactions events without event_type as Anthropic text blocks', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: interaction.created\ndata: {"interaction":{"id":"int_anthropic_live_1","object":"interaction","status":"in_progress","model":"gemma-4-31b-it"}}\n\n',
+        'event: step.start\ndata: {"index":0,"step":{"type":"model_output"}}\n\n',
+        'event: step.delta\ndata: {"index":0,"delta":{"type":"text","text":"live hello"}}\n\n',
+        'event: step.stop\ndata: {"index":0}\n\n',
+        'event: interaction.completed\ndata: {"interaction":{"id":"int_anthropic_live_1","object":"interaction","status":"completed","model":"gemma-4-31b-it","usage":{"total_input_tokens":4,"total_output_tokens":2,"total_tokens":6}}}\n\n',
+        'event: done\ndata: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemma-4-31b-it'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gemma-4-31b-it',
+          max_tokens: 64,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('event: content_block_start');
+      expect(response.body).toContain('"type":"text_delta","text":"live hello"');
+      expect(response.body).toContain('event: content_block_stop');
+      expect(response.body).toContain('"output_tokens":2');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('streams Gemini Interactions thought summary deltas as Anthropic thinking blocks', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: interaction.created\ndata: {"interaction":{"id":"int_anthropic_thought_1","status":"in_progress","object":"interaction","model":"gemma-4-31b-it"},"event_type":"interaction.created"}\n\n',
+        'event: interaction.status_update\ndata: {"interaction_id":"int_anthropic_thought_1","status":"in_progress","event_type":"interaction.status_update"}\n\n',
+        'event: step.start\ndata: {"index":0,"step":{"type":"thought"},"event_type":"step.start"}\n\n',
+        'event: step.delta\ndata: {"index":0,"delta":{"content":{"text":"* User request: pong","type":"text"},"type":"thought_summary"},"event_type":"step.delta"}\n\n',
+        'event: step.delta\ndata: {"index":0,"delta":{"signature":"sig_1","type":"thought_signature"},"event_type":"step.delta"}\n\n',
+        'event: step.stop\ndata: {"index":0,"event_type":"step.stop"}\n\n',
+        'event: interaction.completed\ndata: {"interaction":{"id":"int_anthropic_thought_1","status":"incomplete","usage":{"total_tokens":34,"total_input_tokens":5,"total_cached_tokens":0,"total_output_tokens":0,"total_thought_tokens":29},"object":"interaction","model":"gemma-4-31b-it"},"event_type":"interaction.completed"}\n\n',
+        'event: done\ndata: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemma-4-31b-it'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gemma-4-31b-it',
+          max_tokens: 32,
+          stream: true,
+          messages: [{ role: 'user', content: '请只回复 pong' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('"type":"thinking"');
+      expect(response.body).toContain('"type":"thinking_delta","thinking":"* User request: pong"');
+      expect(response.body).toContain('"input_tokens":5');
+      expect(response.body).toContain('"output_tokens":0');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('relays Gemini Interactions stream errors as Anthropic error events', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: interaction.created\ndata: {"interaction":{"id":"int_anthropic_error_1","status":"in_progress","object":"interaction","model":"gemma-4-31b-it"},"event_type":"interaction.created"}\n\n',
+        'event: error\ndata: {"error":{"message":"Internal error encountered.","code":"api_error"},"event_type":"error"}\n\n',
+        'event: done\ndata: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemma-4-31b-it'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gemma-4-31b-it',
+          max_tokens: 32,
+          stream: true,
+          messages: [{ role: 'user', content: '请只回复 pong' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('event: error');
+      expect(response.body).toContain('"type":"api_error"');
+      expect(response.body).toContain('"message":"Internal error encountered."');
+      expect(response.body).not.toContain('event: message_stop');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('does not finalize empty Gemini Interactions streams as successful Anthropic messages', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: interaction.created\ndata: {"interaction":{"id":"int_anthropic_empty_1","status":"in_progress","object":"interaction","model":"gemma-4-31b-it"},"event_type":"interaction.created"}\n\n',
+        'event: done\ndata: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemma-4-31b-it'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gemma-4-31b-it',
+          max_tokens: 32,
+          stream: true,
+          messages: [{ role: 'user', content: '请只回复 pong' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('event: error');
+      expect(response.body).toContain('Gemini Interactions stream ended without content.');
+      expect(response.body).not.toContain('event: message_stop');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('replays completed Gemini Interactions steps when streaming deltas are absent', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: interaction.created\ndata: {"event_type":"interaction.created","interaction":{"id":"int_anthropic_completed_steps_1","object":"interaction","status":"in_progress","model":"gemma-4-31b-it"}}\n\n',
+        'event: interaction.completed\ndata: {"event_type":"interaction.completed","interaction":{"id":"int_anthropic_completed_steps_1","object":"interaction","status":"completed","model":"gemma-4-31b-it","steps":[{"type":"model_output","content":[{"type":"text","text":"completed text"}]}],"usage":{"total_input_tokens":5,"total_output_tokens":3,"total_tokens":8}}}\n\n',
+        'event: done\ndata: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemma-4-31b-it'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'gemma-4-31b-it',
+          max_tokens: 64,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"type":"text_delta","text":"completed text"');
+      expect(response.body).toContain('"output_tokens":3');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('streams Gemini Interactions upstream events as OpenAI Responses events', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: interaction.created\ndata: {"event_type":"interaction.created","interaction":{"id":"int_stream_1","object":"interaction","status":"in_progress","model":"gemini-2.5-flash"}}\n\n',
+        'event: step.start\ndata: {"event_type":"step.start","index":0,"step":{"type":"model_output"}}\n\n',
+        'event: step.delta\ndata: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"hello "}}\n\n',
+        'event: step.delta\ndata: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"world"}}\n\n',
+        'event: step.stop\ndata: {"event_type":"step.stop","index":0}\n\n',
+        'event: interaction.completed\ndata: {"event_type":"interaction.completed","interaction":{"id":"int_stream_1","object":"interaction","status":"completed","model":"gemini-2.5-flash","usage":{"total_input_tokens":3,"total_output_tokens":2,"total_tokens":5}}}\n\n',
+        'event: done\ndata: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['gemini-2.5-flash'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main'
+        },
+        payload: {
+          model: 'gemini-2.5-flash',
+          input: 'hello',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(JSON.parse(String(upstreamInit.body))).toMatchObject({
+        model: 'gemini-2.5-flash',
+        input: 'hello',
+        stream: true
+      });
+
+      expect(response.body).toContain('"type":"response.created"');
+      expect(response.body).toContain('"type":"response.output_text.delta","delta":"hello "');
+      expect(response.body).toContain('"type":"response.output_text.delta","delta":"world"');
+      expect(response.body).toContain('"type":"response.completed"');
+      expect(response.body).toContain('"input_tokens":3');
+      expect(response.body).toContain('"output_tokens":2');
+      expect(response.body).toContain('"total_tokens":5');
+      expect(response.body).toContain('data: [DONE]');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('converts Gemini Interactions requests to OpenAI chat targets', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'chatcmpl_interactions_1',
+          object: 'chat.completion',
+          model: 'glm-5',
+          choices: [
+            {
+              index: 0,
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'hello from chat'
+              }
+            }
+          ],
+          usage: {
+            prompt_tokens: 4,
+            completion_tokens: 3,
+            total_tokens: 7
+          }
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1beta/interactions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          input: [
+            {
+              type: 'user_input',
+              content: [{ type: 'text', text: 'hello' }]
+            }
+          ],
+          generation_config: {
+            temperature: 0.1,
+            max_output_tokens: 64
+          },
+          tools: [
+            {
+              type: 'function',
+              name: 'get_weather',
+              parameters: {
+                type: 'object',
+                properties: {
+                  city: { type: 'string' }
+                },
+                required: ['city']
+              }
+            }
+          ],
+          tool_choice: {
+            allowed_tools: {
+              mode: 'any',
+              tools: ['get_weather']
+            }
+          }
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://api.openai.com/v1/chat/completions');
+      const upstreamBody = JSON.parse(String(upstreamInit.body));
+      expect(upstreamBody).toMatchObject({
+        model: 'glm-5',
+        messages: [{ role: 'user', content: 'hello' }],
+        temperature: 0.1,
+        max_tokens: 64,
+        tool_choice: {
+          type: 'function',
+          function: {
+            name: 'get_weather'
+          }
+        }
+      });
+      expect(upstreamBody.tools).toEqual([
+        {
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            parameters: {
+              type: 'object',
+              properties: {
+                city: { type: 'string' }
+              },
+              required: ['city']
+            }
+          }
+        }
+      ]);
+
+      const body = JSON.parse(response.body);
+      expect(body).toMatchObject({
+        id: 'chatcmpl_interactions_1',
+        object: 'interaction',
+        model: 'glm-5',
+        status: 'completed',
+        steps: [
+          {
+            type: 'model_output',
+            content: [{ type: 'text', text: 'hello from chat' }]
+          }
+        ],
+        usage: {
+          total_input_tokens: 4,
+          total_output_tokens: 3,
+          total_tokens: 7
+        }
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('streams OpenAI chat deltas as Gemini Interactions events', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'data: {"id":"chatcmpl_interactions_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+        'data: {"id":"chatcmpl_interactions_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"hello "}}]}\n\n',
+        'data: {"id":"chatcmpl_interactions_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_weather","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Sh"}}]}}]}\n\n',
+        'data: {"id":"chatcmpl_interactions_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"arguments":"anghai\\"}"}}]}}]}\n\n',
+        'data: {"id":"chatcmpl_interactions_stream_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1beta/interactions',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'openai-main'
+        },
+        payload: {
+          model: 'glm-5',
+          input: 'hello',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(JSON.parse(String(upstreamInit.body))).toMatchObject({
+        model: 'glm-5',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+        stream_options: {
+          include_usage: true
+        }
+      });
+
+      expect(response.body).toContain('event: interaction.created');
+      expect(response.body).toContain('"event_type":"step.delta"');
+      expect(response.body).toContain('"delta":{"type":"text","text":"hello "}');
+      expect(response.body).toContain('"step":{"type":"function_call","id":"call_weather","name":"get_weather","arguments":{}}');
+      expect(response.body).toContain('"delta":{"type":"arguments_delta","arguments":"{\\"city\\":\\"Sh"}');
+      expect(response.body).toContain('"delta":{"type":"arguments_delta","arguments":"anghai\\"}"}');
+      expect(response.body).toContain('"status":"requires_action"');
+      expect(response.body).toContain('"usage":{"total_input_tokens":5,"total_output_tokens":4,"total_tokens":9');
+      expect(response.body).toContain('event: done\ndata: [DONE]');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('passes through Gemini Interactions requests to matching Gemini Interactions targets', async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          id: 'int_passthrough_1',
+          object: 'interaction',
+          status: 'completed',
+          agent: 'agents/weather-agent',
+          steps: [
+            {
+              type: 'model_output',
+              content: [{ type: 'text', text: 'passthrough ok' }]
+            }
+          ]
+        }),
+        {
+          status: 200,
+          headers: {
+            'content-type': 'application/json'
+          }
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([createProviderConfig('google-main', 'gemini_interactions', ['agents/weather-agent'])]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1beta/interactions?fields=steps&ignored=true',
+        headers: {
+          'content-type': 'application/json',
+          'x-target-provider': 'google-main'
+        },
+        payload: {
+          agent: 'agents/weather-agent',
+          input: 'hello'
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const [upstreamUrl, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(upstreamUrl).toBe('https://generativelanguage.googleapis.com/v1beta/interactions?fields=steps&key=gemini-test-key');
+      expect(JSON.parse(String(upstreamInit.body))).toEqual({
+        agent: 'agents/weather-agent',
+        input: 'hello'
+      });
+      expect(JSON.parse(response.body)).toMatchObject({
+        id: 'int_passthrough_1',
+        object: 'interaction',
+        status: 'completed'
+      });
+    } finally {
+      await app.close();
+    }
+  });
+
   it('rejects requests when model is not configured for the target provider', async () => {
     const fetchMock = vi.fn(async () => {
       return new Response(JSON.stringify({ ok: true }), {

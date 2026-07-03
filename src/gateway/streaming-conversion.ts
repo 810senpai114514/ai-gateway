@@ -23,7 +23,7 @@ import type {
   StandardResponseReasoning,
   StandardUsage
 } from '../types';
-import { asNumber, asString, isObject } from '../utils';
+import { asNumber, asString, extractTextFromPart, isObject } from '../utils';
 
 interface OpenAIResponsesRelayState {
   started: boolean;
@@ -101,6 +101,7 @@ interface AnthropicRelayState {
   activeBlockIndex?: number;
   nextBlockIndex: number;
   pendingToolCalls: Map<number, PendingAnthropicToolCall>;
+  sawGeminiInteractionsEvent?: boolean;
 }
 
 type AnthropicContentBlockType = 'text' | 'thinking';
@@ -133,6 +134,48 @@ interface OpenAIChatRelayState {
     cachedPromptTokens?: number;
     cacheCreationPromptTokens?: number;
   };
+}
+
+interface GeminiInteractionsRelayState {
+  started: boolean;
+  finished: boolean;
+  interactionId: string;
+  model: string;
+  outputText: string;
+  reasoningText: string;
+  reasoningSummaryText: string;
+  nextStepIndex: number;
+  modelOutputStepIndex?: number;
+  modelOutputStarted: boolean;
+  modelOutputStopped: boolean;
+  thoughtStepIndex?: number;
+  thoughtStarted: boolean;
+  thoughtStopped: boolean;
+  pendingToolCalls: Map<number, PendingGeminiInteractionToolCall>;
+  activeToolCall?: PendingGeminiInteractionToolCall;
+  hasToolCalls: boolean;
+  usage: Record<string, unknown>;
+  status?: string;
+}
+
+interface PendingGeminiInteractionToolCall {
+  index: number;
+  stepIndex: number;
+  id: string;
+  name: string;
+  argumentsJson: string;
+  started: boolean;
+  stopped: boolean;
+}
+
+interface GeminiInteractionsNonStreamCollectionState {
+  id: string;
+  model: string;
+  status?: string;
+  usage: Record<string, unknown>;
+  steps: Map<number, Record<string, unknown>>;
+  functionArgumentsByIndex: Map<number, string>;
+  completedInteraction?: Record<string, unknown>;
 }
 
 interface PendingOpenAIChatAnthropicToolCall {
@@ -238,6 +281,8 @@ export function relayConvertedStreamFromUpstreamResponse(
     stream = Readable.from(relayOpenAIResponsesFromOpenAIStream(upstreamResponse, standardRequest?.tools));
   } else if (source.adapterKey === 'gemini_stream') {
     stream = Readable.from(relayGeminiStreamFromOpenAIStream(upstreamResponse));
+  } else if (source.adapterKey === 'gemini_interactions') {
+    stream = Readable.from(relayGeminiInteractionsFromUpstreamStream(upstreamResponse));
   } else if (source.adapterKey === 'openai_chat') {
     stream = Readable.from(relayOpenAIChatFromUpstreamStream(upstreamResponse));
   } else {
@@ -760,6 +805,298 @@ export async function collectAnthropicNonStreamPayloadFromEventStream(
   };
 }
 
+export async function collectGeminiInteractionsNonStreamPayloadFromEventStream(
+  upstreamResponse: Response,
+  abortSignal?: AbortSignal
+): Promise<Record<string, unknown>> {
+  const state: GeminiInteractionsNonStreamCollectionState = {
+    id: `v1_${randomUUID().replace(/-/g, '')}`,
+    model: 'unknown',
+    usage: {},
+    steps: new Map(),
+    functionArgumentsByIndex: new Map()
+  };
+
+  for await (const chunk of parseSseChunks(upstreamResponse, abortSignal)) {
+    const data = chunk.data.trim();
+    if (!data || data === '[DONE]') {
+      continue;
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    if (!isObject(payload)) {
+      continue;
+    }
+
+    collectGeminiInteractionsNonStreamEvent(state, payload, chunk.event);
+  }
+
+  return buildGeminiInteractionsNonStreamPayload(state);
+}
+
+function collectGeminiInteractionsNonStreamEvent(
+  state: GeminiInteractionsNonStreamCollectionState,
+  payload: Record<string, unknown>,
+  sseEvent?: string
+): void {
+  const eventType = asString(payload.event_type) || asString(payload.type) || sseEvent || '';
+  if (eventType === 'interaction.created') {
+    mergeGeminiInteractionEnvelope(state, isObject(payload.interaction) ? payload.interaction : undefined);
+    return;
+  }
+
+  if (eventType === 'step.start') {
+    const step = isObject(payload.step) ? payload.step : undefined;
+    if (!step) {
+      return;
+    }
+    const index = asNumber(payload.index) ?? state.steps.size;
+    const normalized = normalizeGeminiInteractionCollectedStep(step);
+    state.steps.set(index, normalized);
+    const argumentsJson = normalizeStreamToolArguments(normalized.arguments);
+    if (argumentsJson) {
+      state.functionArgumentsByIndex.set(index, argumentsJson);
+    }
+    return;
+  }
+
+  if (eventType === 'step.delta') {
+    const index = asNumber(payload.index) ?? state.steps.size;
+    const delta = isObject(payload.delta) ? payload.delta : undefined;
+    if (!delta) {
+      return;
+    }
+    mergeGeminiInteractionStepDelta(state, index, delta);
+    return;
+  }
+
+  if (eventType === 'interaction.completed') {
+    const interaction = isObject(payload.interaction) ? payload.interaction : undefined;
+    if (interaction) {
+      state.completedInteraction = interaction;
+    }
+    mergeGeminiInteractionEnvelope(state, interaction);
+  }
+}
+
+function mergeGeminiInteractionEnvelope(
+  state: GeminiInteractionsNonStreamCollectionState,
+  interaction: Record<string, unknown> | undefined
+): void {
+  if (!interaction) {
+    return;
+  }
+
+  const id = asString(interaction.id);
+  if (id) {
+    state.id = id;
+  }
+  const model = asString(interaction.model) || asString(interaction.agent);
+  if (model) {
+    state.model = model;
+  }
+  const status = asString(interaction.status);
+  if (status) {
+    state.status = status;
+  }
+  if (isObject(interaction.usage)) {
+    state.usage = interaction.usage;
+  }
+}
+
+function normalizeGeminiInteractionCollectedStep(step: Record<string, unknown>): Record<string, unknown> {
+  const type = asString(step.type);
+  if (type === 'model_output') {
+    return {
+      ...step,
+      content: Array.isArray(step.content) ? [...step.content] : []
+    };
+  }
+
+  if (type === 'thought') {
+    return {
+      ...step,
+      summary: Array.isArray(step.summary) ? [...step.summary] : []
+    };
+  }
+
+  return { ...step };
+}
+
+function mergeGeminiInteractionStepDelta(
+  state: GeminiInteractionsNonStreamCollectionState,
+  index: number,
+  delta: Record<string, unknown>
+): void {
+  const deltaType = asString(delta.type);
+  if (deltaType === 'text') {
+    const step = ensureGeminiInteractionCollectedStep(state, index, 'model_output');
+    const text = asString(delta.text) || extractGeminiInteractionContentText(delta.content);
+    if (text) {
+      appendGeminiInteractionContent(step, { type: 'text', text });
+    }
+    return;
+  }
+
+  if (deltaType === 'thought_summary') {
+    const step = ensureGeminiInteractionCollectedStep(state, index, 'thought');
+    const content = isObject(delta.content) ? delta.content : undefined;
+    const text = extractGeminiInteractionContentText(content) || asString(delta.text);
+    if (content) {
+      appendGeminiInteractionSummary(step, content);
+    } else if (text) {
+      appendGeminiInteractionSummary(step, { type: 'text', text });
+    }
+    return;
+  }
+
+  if (deltaType === 'thought_signature') {
+    const step = ensureGeminiInteractionCollectedStep(state, index, 'thought');
+    const signature = asString(delta.signature);
+    if (signature) {
+      step.signature = signature;
+    }
+    return;
+  }
+
+  if (deltaType === 'arguments_delta') {
+    const step = ensureGeminiInteractionCollectedStep(state, index, 'function_call');
+    const argumentsDelta =
+      asString(delta.arguments) ||
+      asString(delta.arguments_delta) ||
+      asString(delta.text) ||
+      '';
+    if (argumentsDelta) {
+      const existing = state.functionArgumentsByIndex.get(index) || '';
+      state.functionArgumentsByIndex.set(index, existing + argumentsDelta);
+    }
+  }
+}
+
+function ensureGeminiInteractionCollectedStep(
+  state: GeminiInteractionsNonStreamCollectionState,
+  index: number,
+  type: string
+): Record<string, unknown> {
+  const existing = state.steps.get(index);
+  if (existing) {
+    return existing;
+  }
+
+  const step: Record<string, unknown> = {
+    type
+  };
+  if (type === 'model_output') {
+    step.content = [];
+  } else if (type === 'thought') {
+    step.summary = [];
+  }
+  state.steps.set(index, step);
+  return step;
+}
+
+function appendGeminiInteractionContent(step: Record<string, unknown>, content: Record<string, unknown>): void {
+  const existing = Array.isArray(step.content) ? step.content : [];
+  if (mergeGeminiInteractionTextContent(existing, content)) {
+    step.content = existing;
+    return;
+  }
+  existing.push(content);
+  step.content = existing;
+}
+
+function appendGeminiInteractionSummary(step: Record<string, unknown>, content: Record<string, unknown>): void {
+  const existing = Array.isArray(step.summary) ? step.summary : [];
+  if (mergeGeminiInteractionTextContent(existing, content)) {
+    step.summary = existing;
+    return;
+  }
+  existing.push(content);
+  step.summary = existing;
+}
+
+function mergeGeminiInteractionTextContent(existing: unknown[], content: Record<string, unknown>): boolean {
+  const contentType = asString(content.type);
+  const text = asString(content.text);
+  if (contentType !== 'text' || !text || existing.length === 0) {
+    return false;
+  }
+
+  const last = existing[existing.length - 1];
+  if (!isObject(last) || asString(last.type) !== 'text') {
+    return false;
+  }
+
+  const previousText = asString(last.text);
+  if (previousText === undefined) {
+    return false;
+  }
+
+  last.text = previousText + text;
+  return true;
+}
+
+function extractGeminiInteractionContentText(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content.map(extractTextFromPart).filter(Boolean).join('\n').trim();
+  }
+  if (!isObject(content)) {
+    return '';
+  }
+  return asString(content.text) || '';
+}
+
+function buildGeminiInteractionsNonStreamPayload(
+  state: GeminiInteractionsNonStreamCollectionState
+): Record<string, unknown> {
+  const completed = state.completedInteraction ? { ...state.completedInteraction } : {};
+  const completedSteps = Array.isArray(completed.steps) ? completed.steps : undefined;
+  const steps = completedSteps && completedSteps.length > 0
+    ? completedSteps
+    : [...state.steps.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([index, step]) => finalizeGeminiInteractionCollectedStep(index, step, state));
+
+  return {
+    ...completed,
+    id: asString(completed.id) || state.id,
+    object: asString(completed.object) || 'interaction',
+    status: asString(completed.status) || state.status || 'completed',
+    model: asString(completed.model) || state.model,
+    steps,
+    usage: isObject(completed.usage) ? completed.usage : state.usage
+  };
+}
+
+function finalizeGeminiInteractionCollectedStep(
+  index: number,
+  step: Record<string, unknown>,
+  state: GeminiInteractionsNonStreamCollectionState
+): Record<string, unknown> {
+  if (asString(step.type) !== 'function_call') {
+    return step;
+  }
+
+  const argumentsJson = state.functionArgumentsByIndex.get(index);
+  if (argumentsJson === undefined) {
+    return step;
+  }
+
+  return {
+    ...step,
+    arguments: parseStreamToolArguments(argumentsJson)
+  };
+}
+
 function buildConvertedStreamFrames(source: GatewaySourceContext, standardResponse: StandardResponse): string[] {
   if (source.adapterKey === 'openai_chat') {
     return buildOpenAIChatStreamFrames(standardResponse);
@@ -775,6 +1112,10 @@ function buildConvertedStreamFrames(source: GatewaySourceContext, standardRespon
 
   if (source.adapterKey === 'gemini_stream') {
     return buildGeminiStreamFrames(standardResponse);
+  }
+
+  if (source.adapterKey === 'gemini_interactions') {
+    return buildGeminiInteractionsStreamFrames(standardResponse);
   }
 
   return buildOpenAIChatStreamFrames(standardResponse);
@@ -1503,6 +1844,348 @@ function buildGeminiStreamFrames(standardResponse: StandardResponse): string[] {
   return [encodeSseData(formatGeminiGenerateContentResponse(standardResponse))];
 }
 
+function buildGeminiInteractionsStreamFrames(standardResponse: StandardResponse): string[] {
+  const state = createGeminiInteractionsRelayState(standardResponse.id, standardResponse.model);
+  const frames = ensureGeminiInteractionsRelayStarted(state);
+
+  for (const item of standardResponse.output) {
+    if (item.type === 'reasoning') {
+      const text = collectStandardReasoningText(item);
+      const summary = item.summary.map((entry) => entry.text).filter(Boolean).join('\n').trim();
+      if (summary) {
+        frames.push(...emitGeminiInteractionsThoughtDelta(state, 'thought_summary', summary));
+      }
+      if (text) {
+        frames.push(...emitGeminiInteractionsThoughtDelta(state, 'thought_summary', text));
+      }
+      continue;
+    }
+
+    if (item.type === 'message') {
+      for (const content of item.content) {
+        if (content.type === 'output_text' && content.text) {
+          frames.push(...emitGeminiInteractionsTextDelta(state, content.text));
+        }
+      }
+      continue;
+    }
+
+    const toolCall = mergeGeminiInteractionsToolCall(state, item.call_id || item.id, item.name, item.arguments);
+    frames.push(...ensureGeminiInteractionsToolCallStarted(state, toolCall));
+    frames.push(...emitGeminiInteractionsToolArgumentsDelta(state, toolCall, item.arguments));
+  }
+
+  state.usage = buildGeminiInteractionsUsageFromStandardUsage(standardResponse.usage);
+  state.status = standardResponse.output.some((item) => item.type === 'function_call')
+    ? 'requires_action'
+    : standardResponse.status;
+  frames.push(...finalizeGeminiInteractionsRelay(state));
+  frames.push(encodeGeminiInteractionsDoneEvent());
+  return frames;
+}
+
+function createGeminiInteractionsRelayState(
+  interactionId = `v1_${randomUUID().replace(/-/g, '')}`,
+  model = 'unknown'
+): GeminiInteractionsRelayState {
+  return {
+    started: false,
+    finished: false,
+    interactionId,
+    model,
+    outputText: '',
+    reasoningText: '',
+    reasoningSummaryText: '',
+    nextStepIndex: 0,
+    modelOutputStarted: false,
+    modelOutputStopped: false,
+    thoughtStarted: false,
+    thoughtStopped: false,
+    pendingToolCalls: new Map(),
+    hasToolCalls: false,
+    usage: {}
+  };
+}
+
+function ensureGeminiInteractionsRelayStarted(state: GeminiInteractionsRelayState): string[] {
+  if (state.started) {
+    return [];
+  }
+
+  state.started = true;
+  return [
+    encodeSseEvent('interaction.created', {
+      interaction: {
+        id: state.interactionId,
+        status: 'in_progress',
+        object: 'interaction',
+        model: state.model
+      },
+      event_type: 'interaction.created'
+    })
+  ];
+}
+
+function emitGeminiInteractionsTextDelta(state: GeminiInteractionsRelayState, text: string): string[] {
+  if (!text) {
+    return [];
+  }
+
+  const frames = ensureGeminiInteractionsModelOutputStarted(state);
+  state.outputText += text;
+  frames.push(
+    encodeSseEvent('step.delta', {
+      index: state.modelOutputStepIndex,
+      delta: {
+        type: 'text',
+        text
+      },
+      event_type: 'step.delta'
+    })
+  );
+  return frames;
+}
+
+function ensureGeminiInteractionsModelOutputStarted(state: GeminiInteractionsRelayState): string[] {
+  const frames = ensureGeminiInteractionsRelayStarted(state);
+  if (state.modelOutputStarted) {
+    return frames;
+  }
+
+  state.modelOutputStepIndex = state.nextStepIndex++;
+  state.modelOutputStarted = true;
+  frames.push(
+    encodeSseEvent('step.start', {
+      index: state.modelOutputStepIndex,
+      step: {
+        type: 'model_output'
+      },
+      event_type: 'step.start'
+    })
+  );
+  return frames;
+}
+
+function emitGeminiInteractionsThoughtDelta(
+  state: GeminiInteractionsRelayState,
+  type: 'thought_summary' | 'thought_signature',
+  value: string
+): string[] {
+  if (!value) {
+    return [];
+  }
+
+  const frames = ensureGeminiInteractionsThoughtStarted(state);
+  if (type === 'thought_summary') {
+    state.reasoningSummaryText += value;
+    frames.push(
+      encodeSseEvent('step.delta', {
+        index: state.thoughtStepIndex,
+        delta: {
+          type,
+          content: {
+            type: 'text',
+            text: value
+          }
+        },
+        event_type: 'step.delta'
+      })
+    );
+    return frames;
+  }
+
+  state.reasoningText += value;
+  frames.push(
+    encodeSseEvent('step.delta', {
+      index: state.thoughtStepIndex,
+      delta: {
+        type,
+        signature: value
+      },
+      event_type: 'step.delta'
+    })
+  );
+  return frames;
+}
+
+function ensureGeminiInteractionsThoughtStarted(state: GeminiInteractionsRelayState): string[] {
+  const frames = ensureGeminiInteractionsRelayStarted(state);
+  if (state.thoughtStarted) {
+    return frames;
+  }
+
+  state.thoughtStepIndex = state.nextStepIndex++;
+  state.thoughtStarted = true;
+  frames.push(
+    encodeSseEvent('step.start', {
+      index: state.thoughtStepIndex,
+      step: {
+        type: 'thought'
+      },
+      event_type: 'step.start'
+    })
+  );
+  return frames;
+}
+
+function mergeGeminiInteractionsToolCall(
+  state: GeminiInteractionsRelayState,
+  id: string | undefined,
+  name: string | undefined,
+  argumentsJson: string | undefined,
+  index?: number
+): PendingGeminiInteractionToolCall {
+  const toolIndex = index ?? state.pendingToolCalls.size;
+  const existing = state.pendingToolCalls.get(toolIndex);
+  const pending: PendingGeminiInteractionToolCall = existing || {
+    index: toolIndex,
+    stepIndex: state.nextStepIndex++,
+    id: id || `call_${randomUUID().replace(/-/g, '')}`,
+    name: name || 'tool',
+    argumentsJson: '',
+    started: false,
+    stopped: false
+  };
+
+  if (id) {
+    pending.id = id;
+  }
+  if (name) {
+    pending.name = name;
+  }
+  if (argumentsJson !== undefined) {
+    pending.argumentsJson += argumentsJson;
+  }
+
+  state.pendingToolCalls.set(toolIndex, pending);
+  state.hasToolCalls = true;
+  return pending;
+}
+
+function ensureGeminiInteractionsToolCallStarted(
+  state: GeminiInteractionsRelayState,
+  toolCall: PendingGeminiInteractionToolCall
+): string[] {
+  const frames = ensureGeminiInteractionsRelayStarted(state);
+  if (toolCall.started) {
+    return frames;
+  }
+
+  toolCall.started = true;
+  state.activeToolCall = toolCall;
+  frames.push(
+    encodeSseEvent('step.start', {
+      index: toolCall.stepIndex,
+      step: {
+        type: 'function_call',
+        id: toolCall.id,
+        name: toolCall.name,
+        arguments: {}
+      },
+      event_type: 'step.start'
+    })
+  );
+  return frames;
+}
+
+function emitGeminiInteractionsToolArgumentsDelta(
+  state: GeminiInteractionsRelayState,
+  toolCall: PendingGeminiInteractionToolCall,
+  argumentsDelta: string
+): string[] {
+  if (!argumentsDelta) {
+    return [];
+  }
+
+  const frames = ensureGeminiInteractionsToolCallStarted(state, toolCall);
+  frames.push(
+    encodeSseEvent('step.delta', {
+      index: toolCall.stepIndex,
+      delta: {
+        type: 'arguments_delta',
+        arguments: argumentsDelta
+      },
+      event_type: 'step.delta'
+    })
+  );
+  return frames;
+}
+
+function finalizeGeminiInteractionsRelay(state: GeminiInteractionsRelayState): string[] {
+  if (state.finished) {
+    return [];
+  }
+
+  const frames = ensureGeminiInteractionsRelayStarted(state);
+  if (state.thoughtStarted && !state.thoughtStopped) {
+    frames.push(encodeGeminiInteractionsStepStop(state.thoughtStepIndex));
+    state.thoughtStopped = true;
+  }
+  if (state.modelOutputStarted && !state.modelOutputStopped) {
+    frames.push(encodeGeminiInteractionsStepStop(state.modelOutputStepIndex));
+    state.modelOutputStopped = true;
+  }
+
+  for (const toolCall of [...state.pendingToolCalls.values()].sort((a, b) => a.stepIndex - b.stepIndex)) {
+    if (!toolCall.started) {
+      frames.push(...ensureGeminiInteractionsToolCallStarted(state, toolCall));
+    }
+    if (!toolCall.stopped) {
+      frames.push(encodeGeminiInteractionsStepStop(toolCall.stepIndex));
+      toolCall.stopped = true;
+    }
+  }
+
+  const status = state.status || (state.hasToolCalls ? 'requires_action' : 'completed');
+  frames.push(
+    encodeSseEvent('interaction.completed', {
+      interaction: {
+        id: state.interactionId,
+        status,
+        object: 'interaction',
+        model: state.model,
+        usage: state.usage
+      },
+      event_type: 'interaction.completed'
+    })
+  );
+  state.finished = true;
+  return frames;
+}
+
+function encodeGeminiInteractionsStepStop(index: number | undefined): string {
+  return encodeSseEvent('step.stop', {
+    index: index ?? 0,
+    event_type: 'step.stop'
+  });
+}
+
+function encodeGeminiInteractionsDoneEvent(): string {
+  return 'event: done\ndata: [DONE]\n\n';
+}
+
+function buildGeminiInteractionsUsageFromStandardUsage(usage: StandardUsage): Record<string, unknown> {
+  return {
+    total_input_tokens: usage.input_tokens,
+    total_output_tokens: usage.output_tokens,
+    total_tokens: usage.total_tokens,
+    total_cached_tokens: usage.cache_read_tokens
+  };
+}
+
+function collectStandardReasoningText(item: StandardResponseReasoning): string {
+  const text = item.content
+    ?.map((part) => (part.type === 'reasoning_text' ? part.text : ''))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+  if (text) {
+    return text;
+  }
+
+  return item.summary.map((summary) => summary.text).filter(Boolean).join('\n').trim();
+}
+
 async function* relayAnthropicMessagesFromOpenAIStream(upstreamResponse: Response): AsyncGenerator<string> {
   const state: AnthropicRelayState = {
     started: false,
@@ -1521,6 +2204,14 @@ async function* relayAnthropicMessagesFromOpenAIStream(upstreamResponse: Respons
     }
 
     if (data === '[DONE]') {
+      if (shouldEmitEmptyGeminiInteractionsAnthropicError(state)) {
+        yield emitAnthropicStreamErrorFrame(
+          'api_error',
+          'Gemini Interactions stream ended without content.'
+        );
+        state.finished = true;
+        return;
+      }
       yield* flushPendingAnthropicToolCalls(state);
       yield* finalizeAnthropicRelay(state);
       return;
@@ -1537,9 +2228,11 @@ async function* relayAnthropicMessagesFromOpenAIStream(upstreamResponse: Respons
       continue;
     }
 
-    const emittedFrames = isOpenAIResponsesStreamEvent(payload)
-      ? emitAnthropicFramesFromOpenAIResponsesEvent(state, payload)
-      : emitAnthropicFramesFromOpenAIChatChunk(state, payload);
+    const emittedFrames = isGeminiInteractionsStreamEvent(payload, chunk.event)
+      ? emitAnthropicFramesFromGeminiInteractionEvent(state, payload, chunk.event)
+      : isOpenAIResponsesStreamEvent(payload)
+        ? emitAnthropicFramesFromOpenAIResponsesEvent(state, payload)
+        : emitAnthropicFramesFromOpenAIChatChunk(state, payload);
 
     for (const frame of emittedFrames) {
       yield frame;
@@ -1551,6 +2244,14 @@ async function* relayAnthropicMessagesFromOpenAIStream(upstreamResponse: Respons
   }
 
   if (!state.finished) {
+    if (shouldEmitEmptyGeminiInteractionsAnthropicError(state)) {
+      yield emitAnthropicStreamErrorFrame(
+        'api_error',
+        'Gemini Interactions stream ended without content.'
+      );
+      state.finished = true;
+      return;
+    }
     yield* flushPendingAnthropicToolCalls(state);
     yield* finalizeAnthropicRelay(state);
   }
@@ -1606,9 +2307,11 @@ async function* relayOpenAIResponsesFromOpenAIStream(
       continue;
     }
 
-    const emittedFrames = isOpenAIResponsesStreamEvent(payload)
-      ? emitOpenAIResponsesFramesFromResponsesEvent(state, payload)
-      : emitOpenAIResponsesFramesFromChatChunk(state, payload, tools);
+    const emittedFrames = isGeminiInteractionsStreamEvent(payload, chunk.event)
+      ? emitOpenAIResponsesFramesFromGeminiInteractionEvent(state, payload, tools, chunk.event)
+      : isOpenAIResponsesStreamEvent(payload)
+        ? emitOpenAIResponsesFramesFromResponsesEvent(state, payload)
+        : emitOpenAIResponsesFramesFromChatChunk(state, payload, tools);
     for (const frame of emittedFrames) {
       yield frame;
     }
@@ -1658,9 +2361,11 @@ async function* relayGeminiStreamFromOpenAIStream(upstreamResponse: Response): A
       continue;
     }
 
-    const emittedFrames = isOpenAIResponsesStreamEvent(payload)
-      ? emitGeminiFramesFromOpenAIResponsesEvent(state, payload)
-      : emitGeminiFramesFromOpenAIChatChunk(state, payload);
+    const emittedFrames = isGeminiInteractionsStreamEvent(payload, chunk.event)
+      ? emitGeminiFramesFromGeminiInteractionEvent(state, payload, chunk.event)
+      : isOpenAIResponsesStreamEvent(payload)
+        ? emitGeminiFramesFromOpenAIResponsesEvent(state, payload)
+        : emitGeminiFramesFromOpenAIChatChunk(state, payload);
     for (const frame of emittedFrames) {
       yield frame;
     }
@@ -1673,6 +2378,379 @@ async function* relayGeminiStreamFromOpenAIStream(upstreamResponse: Response): A
       yield frame;
     }
   }
+}
+
+async function* relayGeminiInteractionsFromUpstreamStream(upstreamResponse: Response): AsyncGenerator<string> {
+  const state = createGeminiInteractionsRelayState();
+
+  for await (const chunk of parseSseChunks(upstreamResponse)) {
+    const data = chunk.data.trim();
+    if (!data) {
+      continue;
+    }
+
+    if (data === '[DONE]') {
+      if (!state.finished) {
+        yield* finalizeGeminiInteractionsRelay(state);
+      }
+      yield encodeGeminiInteractionsDoneEvent();
+      return;
+    }
+
+    let payload: unknown;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+
+    if (!isObject(payload)) {
+      continue;
+    }
+
+    const emittedFrames = isGeminiInteractionsStreamEvent(payload, chunk.event)
+      ? [encodeSseEvent(chunk.event || asString(payload.event_type) || 'message', payload)]
+      : isOpenAIResponsesStreamEvent(payload)
+        ? emitGeminiInteractionsFramesFromOpenAIResponsesEvent(state, payload)
+        : isAnthropicStreamEvent(payload)
+          ? emitGeminiInteractionsFramesFromAnthropicEvent(state, payload)
+          : isGeminiGenerateContentStreamPayload(payload)
+            ? emitGeminiInteractionsFramesFromGeminiGeneratePayload(state, payload)
+            : emitGeminiInteractionsFramesFromOpenAIChatChunk(state, payload);
+
+    for (const frame of emittedFrames) {
+      yield frame;
+    }
+
+    if (state.finished) {
+      yield encodeGeminiInteractionsDoneEvent();
+      return;
+    }
+  }
+
+  if (!state.finished) {
+    yield* finalizeGeminiInteractionsRelay(state);
+    yield encodeGeminiInteractionsDoneEvent();
+  }
+}
+
+function emitGeminiInteractionsFramesFromOpenAIResponsesEvent(
+  state: GeminiInteractionsRelayState,
+  payload: Record<string, unknown>
+): string[] {
+  const eventType = asString(payload.type) || '';
+  if (eventType === 'response.created') {
+    const response = isObject(payload.response) ? payload.response : undefined;
+    const id = asString(response?.id);
+    const model = asString(response?.model);
+    if (id) {
+      state.interactionId = id;
+    }
+    if (model) {
+      state.model = model;
+    }
+    return ensureGeminiInteractionsRelayStarted(state);
+  }
+
+  if (eventType === 'response.output_text.delta') {
+    return emitGeminiInteractionsTextDelta(state, asString(payload.delta) || '');
+  }
+
+  if (eventType === 'response.reasoning_text.delta') {
+    return emitGeminiInteractionsThoughtDelta(state, 'thought_summary', asString(payload.delta) || '');
+  }
+
+  if (eventType === 'response.reasoning_summary_text.delta') {
+    return emitGeminiInteractionsThoughtDelta(state, 'thought_summary', asString(payload.delta) || '');
+  }
+
+  if (eventType === 'response.output_item.added') {
+    const item = isObject(payload.item) ? payload.item : undefined;
+    if (asString(item?.type) !== 'function_call') {
+      return [];
+    }
+
+    const outputIndex = asNumber(payload.output_index) ?? state.pendingToolCalls.size;
+    const toolCall = mergeGeminiInteractionsToolCall(
+      state,
+      asString(item?.call_id) || asString(item?.id),
+      asString(item?.name),
+      undefined,
+      outputIndex
+    );
+    return ensureGeminiInteractionsToolCallStarted(state, toolCall);
+  }
+
+  if (eventType === 'response.function_call_arguments.delta') {
+    const outputIndex = asNumber(payload.output_index) ?? state.pendingToolCalls.size;
+    const toolCall = mergeGeminiInteractionsToolCall(
+      state,
+      asString(payload.item_id),
+      asString(payload.name),
+      undefined,
+      outputIndex
+    );
+    return emitGeminiInteractionsToolArgumentsDelta(state, toolCall, asString(payload.delta) || '');
+  }
+
+  if (eventType === 'response.output_item.done') {
+    const item = isObject(payload.item) ? payload.item : undefined;
+    if (asString(item?.type) !== 'function_call') {
+      return [];
+    }
+
+    const outputIndex = asNumber(payload.output_index) ?? state.pendingToolCalls.size;
+    const toolCall = mergeGeminiInteractionsToolCall(
+      state,
+      asString(item?.call_id) || asString(item?.id),
+      asString(item?.name),
+      normalizeStreamToolArguments(item?.arguments),
+      outputIndex
+    );
+    const frames = ensureGeminiInteractionsToolCallStarted(state, toolCall);
+    if (!toolCall.stopped) {
+      frames.push(encodeGeminiInteractionsStepStop(toolCall.stepIndex));
+      toolCall.stopped = true;
+    }
+    return frames;
+  }
+
+  if (eventType === 'response.completed') {
+    const response = isObject(payload.response) ? payload.response : undefined;
+    const id = asString(response?.id);
+    const model = asString(response?.model);
+    if (id) {
+      state.interactionId = id;
+    }
+    if (model) {
+      state.model = model;
+    }
+    const outputText = asString(response?.output_text) || extractOpenAIResponsesOutputText(response?.output);
+    const frames: string[] = [];
+    if (outputText && !state.outputText) {
+      frames.push(...emitGeminiInteractionsTextDelta(state, outputText));
+    }
+    state.usage = buildGeminiInteractionsUsageFromOpenAIUsage(isObject(response?.usage) ? response.usage : undefined);
+    frames.push(...finalizeGeminiInteractionsRelay(state));
+    return frames;
+  }
+
+  return [];
+}
+
+function emitGeminiInteractionsFramesFromOpenAIChatChunk(
+  state: GeminiInteractionsRelayState,
+  payload: Record<string, unknown>
+): string[] {
+  const id = asString(payload.id);
+  const model = asString(payload.model);
+  if (id && !state.started) {
+    state.interactionId = id;
+  }
+  if (model) {
+    state.model = model;
+  }
+
+  const frames = ensureGeminiInteractionsRelayStarted(state);
+  const firstChoice = Array.isArray(payload.choices) && isObject(payload.choices[0]) ? payload.choices[0] : undefined;
+  const delta = isObject(firstChoice?.delta) ? firstChoice.delta : undefined;
+  const text = asString(delta?.content) || '';
+  if (text) {
+    frames.push(...emitGeminiInteractionsTextDelta(state, text));
+  }
+
+  const reasoning = asString(delta?.reasoning_content) || asString(delta?.reasoning) || asString(delta?.thinking);
+  if (reasoning) {
+    frames.push(...emitGeminiInteractionsThoughtDelta(state, 'thought_summary', reasoning));
+  }
+
+  frames.push(...emitGeminiInteractionsToolCallsFromOpenAIChatDelta(state, delta?.tool_calls));
+
+  const usage = isObject(payload.usage) ? payload.usage : undefined;
+  if (usage) {
+    state.usage = buildGeminiInteractionsUsageFromOpenAIChatUsage(usage);
+  }
+
+  const finishReason = asString(firstChoice?.finish_reason);
+  if (finishReason) {
+    frames.push(...finalizeGeminiInteractionsRelay(state));
+  }
+
+  return frames;
+}
+
+function emitGeminiInteractionsToolCallsFromOpenAIChatDelta(
+  state: GeminiInteractionsRelayState,
+  rawToolCalls: unknown
+): string[] {
+  if (!Array.isArray(rawToolCalls)) {
+    return [];
+  }
+
+  const frames: string[] = [];
+  for (let position = 0; position < rawToolCalls.length; position += 1) {
+    const rawToolCall = rawToolCalls[position];
+    if (!isObject(rawToolCall)) {
+      continue;
+    }
+    const index = asNumber(rawToolCall.index) ?? position;
+    const functionPayload = isObject(rawToolCall.function) ? rawToolCall.function : undefined;
+    const toolCall = mergeGeminiInteractionsToolCall(
+      state,
+      asString(rawToolCall.id),
+      asString(functionPayload?.name) || asString(rawToolCall.name),
+      undefined,
+      index
+    );
+    frames.push(...ensureGeminiInteractionsToolCallStarted(state, toolCall));
+    const argumentsDelta = readOpenAIChatToolArgumentsPatch(functionPayload, rawToolCall)?.value || '';
+    if (argumentsDelta) {
+      toolCall.argumentsJson += argumentsDelta;
+      frames.push(...emitGeminiInteractionsToolArgumentsDelta(state, toolCall, argumentsDelta));
+    }
+  }
+
+  return frames;
+}
+
+function emitGeminiInteractionsFramesFromAnthropicEvent(
+  state: GeminiInteractionsRelayState,
+  payload: Record<string, unknown>
+): string[] {
+  const eventType = asString(payload.type) || '';
+  if (eventType === 'message_start') {
+    const message = isObject(payload.message) ? payload.message : undefined;
+    const id = asString(message?.id);
+    const model = asString(message?.model);
+    if (id) {
+      state.interactionId = id;
+    }
+    if (model) {
+      state.model = model;
+    }
+    state.usage = buildGeminiInteractionsUsageFromAnthropicUsage(isObject(message?.usage) ? message.usage : undefined);
+    return ensureGeminiInteractionsRelayStarted(state);
+  }
+
+  if (eventType === 'content_block_start') {
+    const block = isObject(payload.content_block) ? payload.content_block : undefined;
+    if (asString(block?.type) !== 'tool_use') {
+      return [];
+    }
+    const index = asNumber(payload.index) ?? state.pendingToolCalls.size;
+    const toolCall = mergeGeminiInteractionsToolCall(
+      state,
+      asString(block?.id),
+      asString(block?.name),
+      undefined,
+      index
+    );
+    return ensureGeminiInteractionsToolCallStarted(state, toolCall);
+  }
+
+  if (eventType === 'content_block_delta') {
+    const delta = isObject(payload.delta) ? payload.delta : undefined;
+    const deltaType = asString(delta?.type);
+    if (deltaType === 'text_delta') {
+      return emitGeminiInteractionsTextDelta(state, asString(delta?.text) || '');
+    }
+    if (deltaType === 'thinking_delta') {
+      return emitGeminiInteractionsThoughtDelta(state, 'thought_summary', asString(delta?.thinking) || '');
+    }
+    if (deltaType === 'input_json_delta') {
+      const index = asNumber(payload.index) ?? 0;
+      const toolCall = state.pendingToolCalls.get(index);
+      if (!toolCall) {
+        return [];
+      }
+      const partialJson = asString(delta?.partial_json) || '';
+      toolCall.argumentsJson += partialJson;
+      return emitGeminiInteractionsToolArgumentsDelta(state, toolCall, partialJson);
+    }
+  }
+
+  if (eventType === 'content_block_stop') {
+    const index = asNumber(payload.index);
+    const toolCall = index !== undefined ? state.pendingToolCalls.get(index) : undefined;
+    if (!toolCall || toolCall.stopped) {
+      return [];
+    }
+    toolCall.stopped = true;
+    return [encodeGeminiInteractionsStepStop(toolCall.stepIndex)];
+  }
+
+  if (eventType === 'message_delta') {
+    state.usage = buildGeminiInteractionsUsageFromAnthropicUsage(isObject(payload.usage) ? payload.usage : undefined);
+  }
+
+  if (eventType === 'message_stop') {
+    return finalizeGeminiInteractionsRelay(state);
+  }
+
+  return [];
+}
+
+function emitGeminiInteractionsFramesFromGeminiGeneratePayload(
+  state: GeminiInteractionsRelayState,
+  payload: Record<string, unknown>
+): string[] {
+  const model = asString(payload.modelVersion);
+  if (model) {
+    state.model = model;
+  }
+
+  const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+  const first = isObject(candidates[0]) ? candidates[0] : undefined;
+  const content = isObject(first?.content) ? first.content : undefined;
+  const parts = Array.isArray(content?.parts) ? content.parts : [];
+  const frames = ensureGeminiInteractionsRelayStarted(state);
+
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!isObject(part)) {
+      continue;
+    }
+    const functionCall = isObject(part.functionCall)
+      ? part.functionCall
+      : isObject(part.function_call)
+        ? part.function_call
+        : undefined;
+    if (functionCall) {
+      const toolCall = mergeGeminiInteractionsToolCall(
+        state,
+        asString(functionCall.id),
+        asString(functionCall.name),
+        normalizeStreamToolArguments(functionCall.args ?? functionCall.arguments),
+        index
+      );
+      frames.push(...ensureGeminiInteractionsToolCallStarted(state, toolCall));
+      if (toolCall.argumentsJson) {
+        frames.push(...emitGeminiInteractionsToolArgumentsDelta(state, toolCall, toolCall.argumentsJson));
+      }
+      continue;
+    }
+
+    const text = asString(part.text);
+    if (text) {
+      frames.push(...emitGeminiInteractionsTextDelta(state, text));
+    }
+  }
+
+  const usage = isObject(payload.usageMetadata) ? payload.usageMetadata : undefined;
+  if (usage) {
+    state.usage = {
+      total_input_tokens: asNumber(usage.promptTokenCount),
+      total_output_tokens: asNumber(usage.candidatesTokenCount),
+      total_tokens: asNumber(usage.totalTokenCount),
+      total_cached_tokens: asNumber(usage.cachedContentTokenCount)
+    };
+  }
+
+  if (asString(first?.finishReason)) {
+    frames.push(...finalizeGeminiInteractionsRelay(state));
+  }
+
+  return frames;
 }
 
 async function* relayOpenAIChatFromUpstreamStream(upstreamResponse: Response): AsyncGenerator<string> {
@@ -1712,9 +2790,11 @@ async function* relayOpenAIChatFromUpstreamStream(upstreamResponse: Response): A
       continue;
     }
 
-    const emittedFrames = isOpenAIResponsesStreamEvent(payload)
-      ? emitOpenAIChatFramesFromOpenAIResponsesEvent(state, payload)
-      : emitOpenAIChatFramesFromAnthropicEvent(state, payload);
+    const emittedFrames = isGeminiInteractionsStreamEvent(payload, chunk.event)
+      ? emitOpenAIChatFramesFromGeminiInteractionEvent(state, payload, chunk.event)
+      : isOpenAIResponsesStreamEvent(payload)
+        ? emitOpenAIChatFramesFromOpenAIResponsesEvent(state, payload)
+        : emitOpenAIChatFramesFromAnthropicEvent(state, payload);
     for (const frame of emittedFrames) {
       yield frame;
     }
@@ -3931,9 +5011,830 @@ function buildAnthropicToolUseDeltaFrame(blockIndex: number, partialJson: string
   });
 }
 
+const geminiInteractionStreamEventTypes = new Set([
+  'interaction.created',
+  'interaction.completed',
+  'interaction.status_update',
+  'step.start',
+  'step.delta',
+  'step.stop',
+  'error'
+]);
+
+function getGeminiInteractionStreamEventType(
+  payload: Record<string, unknown>,
+  sseEvent?: string
+): string {
+  const eventType = asString(payload.event_type);
+  if (eventType) {
+    return eventType;
+  }
+
+  if (sseEvent && geminiInteractionStreamEventTypes.has(sseEvent)) {
+    return sseEvent;
+  }
+
+  const type = asString(payload.type);
+  return type && geminiInteractionStreamEventTypes.has(type) ? type : '';
+}
+
+function isGeminiInteractionsStreamEvent(
+  payload: Record<string, unknown>,
+  sseEvent?: string
+): boolean {
+  return Boolean(getGeminiInteractionStreamEventType(payload, sseEvent));
+}
+
+function isAnthropicStreamEvent(payload: Record<string, unknown>): boolean {
+  const eventType = asString(payload.type);
+  return Boolean(
+    eventType &&
+      (
+        eventType === 'message_start' ||
+        eventType === 'message_delta' ||
+        eventType === 'message_stop' ||
+        eventType === 'content_block_start' ||
+        eventType === 'content_block_delta' ||
+        eventType === 'content_block_stop'
+      )
+  );
+}
+
+function isGeminiGenerateContentStreamPayload(payload: Record<string, unknown>): boolean {
+  return Array.isArray(payload.candidates);
+}
+
 function isOpenAIResponsesStreamEvent(payload: Record<string, unknown>): boolean {
   const eventType = asString(payload.type);
   return typeof eventType === 'string' && eventType.startsWith('response.');
+}
+
+function buildGeminiInteractionsUsageFromOpenAIUsage(
+  usage: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  if (!usage) {
+    return {};
+  }
+
+  return {
+    total_input_tokens: asNumber(usage.input_tokens) ?? asNumber(usage.prompt_tokens),
+    total_output_tokens: asNumber(usage.output_tokens) ?? asNumber(usage.completion_tokens),
+    total_tokens: asNumber(usage.total_tokens),
+    total_cached_tokens:
+      asNumber(isObject(usage.input_tokens_details) ? usage.input_tokens_details.cached_tokens : undefined) ??
+      asNumber(isObject(usage.prompt_tokens_details) ? usage.prompt_tokens_details.cached_tokens : undefined) ??
+      asNumber(usage.cache_read_tokens) ??
+      asNumber(usage.cache_read_input_tokens)
+  };
+}
+
+function buildGeminiInteractionsUsageFromOpenAIChatUsage(
+  usage: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  return buildGeminiInteractionsUsageFromOpenAIUsage(usage);
+}
+
+function buildGeminiInteractionsUsageFromAnthropicUsage(
+  usage: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  if (!usage) {
+    return {};
+  }
+
+  const inputTokens = asNumber(usage.input_tokens);
+  const outputTokens = asNumber(usage.output_tokens);
+  return {
+    total_input_tokens: inputTokens,
+    total_output_tokens: outputTokens,
+    total_tokens:
+      inputTokens !== undefined && outputTokens !== undefined
+        ? inputTokens + outputTokens
+        : undefined,
+    total_cached_tokens: asNumber(usage.cache_read_input_tokens) ?? asNumber(usage.cache_read_tokens)
+  };
+}
+
+function updateOpenAIResponsesRelayUsageFromGeminiInteraction(
+  state: OpenAIResponsesRelayState,
+  interaction: Record<string, unknown> | undefined
+): void {
+  const usage = isObject(interaction?.usage) ? interaction.usage : undefined;
+  if (!usage) {
+    return;
+  }
+
+  state.usage = {
+    input_tokens: asNumber(usage.total_input_tokens),
+    output_tokens: asNumber(usage.total_output_tokens),
+    total_tokens: asNumber(usage.total_tokens),
+    input_tokens_details: {
+      cached_tokens: asNumber(usage.total_cached_tokens) ?? 0
+    },
+    output_tokens_details: {
+      reasoning_tokens: asNumber(usage.total_thought_tokens) ?? 0
+    }
+  };
+}
+
+function updateOpenAIChatRelayUsageFromGeminiInteraction(
+  state: OpenAIChatRelayState,
+  interaction: Record<string, unknown> | undefined
+): void {
+  const usage = isObject(interaction?.usage) ? interaction.usage : undefined;
+  if (!usage) {
+    return;
+  }
+
+  state.usage.promptTokens = asNumber(usage.total_input_tokens);
+  state.usage.completionTokens = asNumber(usage.total_output_tokens);
+  state.usage.totalTokens = asNumber(usage.total_tokens);
+  state.usage.cachedPromptTokens = asNumber(usage.total_cached_tokens);
+}
+
+function updateAnthropicRelayUsageFromGeminiInteraction(
+  state: AnthropicRelayState,
+  interaction: Record<string, unknown> | undefined
+): void {
+  const usage = isObject(interaction?.usage) ? interaction.usage : undefined;
+  if (!usage) {
+    return;
+  }
+
+  state.inputTokens = asNumber(usage.total_input_tokens);
+  state.outputTokens = asNumber(usage.total_output_tokens) ?? state.outputTokens;
+  state.cacheReadInputTokens = asNumber(usage.total_cached_tokens);
+}
+
+function updateGeminiRelayUsageFromGeminiInteraction(
+  state: GeminiRelayState,
+  interaction: Record<string, unknown> | undefined
+): void {
+  const usage = isObject(interaction?.usage) ? interaction.usage : undefined;
+  if (!usage) {
+    return;
+  }
+
+  state.usage.promptTokenCount = asNumber(usage.total_input_tokens);
+  state.usage.candidatesTokenCount = asNumber(usage.total_output_tokens);
+  state.usage.totalTokenCount = asNumber(usage.total_tokens);
+  state.usage.cachedContentTokenCount = asNumber(usage.total_cached_tokens);
+}
+
+function ensureAnthropicRelayStartedForGeminiInteraction(state: AnthropicRelayState): string[] {
+  if (state.started) {
+    return [];
+  }
+
+  state.started = true;
+  return [buildAnthropicMessageStartFrame(state)];
+}
+
+function ensureAnthropicTextBlockStarted(state: AnthropicRelayState): string[] {
+  const frames = ensureAnthropicRelayStartedForGeminiInteraction(state);
+  if (state.activeBlockType === 'text' && state.activeBlockIndex !== undefined) {
+    return frames;
+  }
+
+  if (state.activeBlockIndex !== undefined) {
+    frames.push(buildAnthropicContentBlockStopFrame(state.activeBlockIndex));
+  }
+
+  const index = state.nextBlockIndex++;
+  state.activeBlockType = 'text';
+  state.activeBlockIndex = index;
+  frames.push(buildAnthropicContentBlockStartFrame(index, 'text'));
+  return frames;
+}
+
+function ensureAnthropicThinkingBlockStarted(state: AnthropicRelayState): string[] {
+  const frames = ensureAnthropicRelayStartedForGeminiInteraction(state);
+  if (state.activeBlockType === 'thinking' && state.activeBlockIndex !== undefined) {
+    return frames;
+  }
+
+  if (state.activeBlockIndex !== undefined) {
+    frames.push(buildAnthropicContentBlockStopFrame(state.activeBlockIndex));
+  }
+
+  const index = state.nextBlockIndex++;
+  state.activeBlockType = 'thinking';
+  state.activeBlockIndex = index;
+  frames.push(buildAnthropicContentBlockStartFrame(index, 'thinking'));
+  return frames;
+}
+
+function shouldReplayCompletedGeminiInteractionStepsToAnthropic(
+  state: AnthropicRelayState,
+  interaction: Record<string, unknown> | undefined
+): boolean {
+  return Boolean(
+    interaction &&
+      Array.isArray(interaction.steps) &&
+      interaction.steps.length > 0 &&
+      state.nextBlockIndex === 0 &&
+      state.pendingToolCalls.size === 0
+  );
+}
+
+function emitAnthropicFramesFromCompletedGeminiInteractionSteps(
+  state: AnthropicRelayState,
+  interaction: Record<string, unknown> | undefined
+): string[] {
+  const steps = Array.isArray(interaction?.steps) ? interaction.steps : [];
+  const frames: string[] = [];
+
+  for (const rawStep of steps) {
+    if (!isObject(rawStep)) {
+      continue;
+    }
+
+    const stepType = asString(rawStep.type);
+    if (stepType === 'model_output') {
+      const text = extractGeminiInteractionContentText(rawStep.content);
+      if (text) {
+        frames.push(...emitAnthropicContentDelta(state, 'text', text));
+      }
+      continue;
+    }
+
+    if (stepType === 'thought') {
+      const thinking =
+        extractGeminiInteractionContentText(rawStep.summary) ||
+        extractGeminiInteractionContentText(rawStep.thought_summary) ||
+        asString(rawStep.text) ||
+        asString(rawStep.thought) ||
+        '';
+      if (thinking) {
+        frames.push(...emitAnthropicContentDelta(state, 'thinking', thinking));
+      }
+      continue;
+    }
+
+    if (stepType === 'function_call') {
+      frames.push(...emitAnthropicToolUseFromCompletedGeminiInteractionStep(state, rawStep));
+    }
+  }
+
+  return frames;
+}
+
+function emitAnthropicToolUseFromCompletedGeminiInteractionStep(
+  state: AnthropicRelayState,
+  step: Record<string, unknown>
+): string[] {
+  const name = asString(step.name);
+  if (!name) {
+    return [];
+  }
+
+  const frames = closeActiveAnthropicBlock(state);
+  frames.push(...ensureAnthropicRelayStartedForGeminiInteraction(state));
+  const toolCall: PendingAnthropicToolCall = {
+    index: state.nextBlockIndex,
+    blockIndex: state.nextBlockIndex++,
+    id: asString(step.id) || asString(step.call_id) || `toolu_${randomUUID().replace(/-/g, '')}`,
+    name,
+    argumentsJson: normalizeStreamToolArguments(step.arguments),
+    emittedArgumentsLength: 0,
+    started: true,
+    closed: false
+  };
+
+  frames.push(buildAnthropicToolUseStartFrame(toolCall));
+  if (toolCall.argumentsJson) {
+    frames.push(buildAnthropicToolUseDeltaFrame(toolCall.blockIndex, toolCall.argumentsJson));
+    toolCall.emittedArgumentsLength = toolCall.argumentsJson.length;
+  }
+  toolCall.closed = true;
+  frames.push(buildAnthropicContentBlockStopFrame(toolCall.blockIndex));
+  return frames;
+}
+
+function closeActiveAnthropicBlock(state: AnthropicRelayState): string[] {
+  if (state.activeBlockIndex === undefined) {
+    return [];
+  }
+
+  const frames = [buildAnthropicContentBlockStopFrame(state.activeBlockIndex)];
+  state.activeBlockType = undefined;
+  state.activeBlockIndex = undefined;
+  return frames;
+}
+
+function shouldEmitEmptyGeminiInteractionsAnthropicError(state: AnthropicRelayState): boolean {
+  return Boolean(
+    state.sawGeminiInteractionsEvent &&
+      !state.finished &&
+      state.nextBlockIndex === 0 &&
+      state.pendingToolCalls.size === 0
+  );
+}
+
+function emitAnthropicStreamErrorFrame(type: string, message: string): string {
+  return encodeSseEvent('error', {
+    type: 'error',
+    error: {
+      type,
+      message
+    }
+  });
+}
+
+function extractGeminiInteractionError(payload: Record<string, unknown>): { type: string; message: string } {
+  const error = isObject(payload.error) ? payload.error : undefined;
+  return {
+    type: asString(error?.code) || asString(error?.type) || 'api_error',
+    message:
+      asString(error?.message) ||
+      asString(payload.message) ||
+      'Gemini Interactions stream returned an error.'
+  };
+}
+
+function extractGeminiInteractionDeltaText(delta: Record<string, unknown> | undefined): string {
+  if (!delta) {
+    return '';
+  }
+
+  return (
+    asString(delta.text) ||
+    asString(delta.delta) ||
+    extractGeminiInteractionContentText(delta.content) ||
+    ''
+  );
+}
+
+function emitOpenAIResponsesFramesFromGeminiInteractionEvent(
+  state: OpenAIResponsesRelayState,
+  payload: Record<string, unknown>,
+  tools?: unknown[],
+  sseEvent?: string
+): string[] {
+  const eventType = getGeminiInteractionStreamEventType(payload, sseEvent);
+  if (eventType === 'interaction.created') {
+    const interaction = isObject(payload.interaction) ? payload.interaction : undefined;
+    const id = asString(interaction?.id);
+    const model = asString(interaction?.model) || asString(interaction?.agent);
+    if (id) {
+      state.responseId = id;
+    }
+    if (model) {
+      state.model = model;
+    }
+    return ensureOpenAIResponsesRelayStarted(state);
+  }
+
+  if (eventType === 'step.start') {
+    const step = isObject(payload.step) ? payload.step : undefined;
+    const stepType = asString(step?.type);
+    if (stepType === 'function_call') {
+      const index = asNumber(payload.index) ?? state.pendingToolCalls.size;
+      const name = asString(step?.name);
+      const splitName = name ? splitNamespacedToolCallName(name, tools) : undefined;
+      const toolCall = mergePendingOpenAIResponsesToolCall(
+        state,
+        index,
+        {
+          id: asString(step?.id),
+          callId: asString(step?.id),
+          name: splitName?.name,
+          namespace: splitName?.namespace,
+          argumentsJson: normalizeStreamToolArguments(step?.arguments)
+        },
+        false
+      );
+      const frames = ensureOpenAIResponsesRelayStarted(state);
+      if (!toolCall.added) {
+        frames.push(
+          encodeSseData({
+            type: 'response.output_item.added',
+            output_index: toolCall.outputIndex,
+            item: buildOpenAIResponsesFunctionCallItem(toolCall, 'in_progress')
+          })
+        );
+        toolCall.added = true;
+      }
+      return frames;
+    }
+
+    if (stepType === 'thought') {
+      return ensureOpenAIResponsesReasoningOutputStarted(state);
+    }
+
+    if (stepType === 'model_output') {
+      return ensureOpenAIResponsesRelayStarted(state);
+    }
+  }
+
+  if (eventType === 'step.delta') {
+    const delta = isObject(payload.delta) ? payload.delta : undefined;
+    const deltaType = asString(delta?.type);
+    if (deltaType === 'text') {
+      const text = extractGeminiInteractionDeltaText(delta);
+      if (!text) {
+        return [];
+      }
+      const frames = ensureOpenAIResponsesMessageOutputStarted(state);
+      state.outputText += text;
+      if (state.messageOutputIndex !== undefined) {
+        frames.push(
+          encodeSseData({
+            type: 'response.output_text.delta',
+            delta: text,
+            output_index: state.messageOutputIndex,
+            content_index: 0,
+            item_id: state.messageItemId
+          })
+        );
+      }
+      return frames;
+    }
+
+    if (deltaType === 'thought_summary') {
+      const content = isObject(delta?.content) ? delta.content : undefined;
+      return emitOpenAIResponsesReasoningSummaryDelta(
+        state,
+        asString(content?.text) || asString(delta?.text) || ''
+      );
+    }
+
+    if (deltaType === 'thought_signature') {
+      const signature = asString(delta?.signature);
+      if (!signature || state.reasoningEncryptedContent) {
+        return [];
+      }
+      state.reasoningEncryptedContent = signature;
+      return ensureOpenAIResponsesReasoningOutputStarted(state);
+    }
+
+    if (deltaType === 'arguments_delta') {
+      const index = asNumber(payload.index) ?? state.pendingToolCalls.size;
+      const argumentsDelta = asString(delta?.arguments) || '';
+      const toolCall = mergePendingOpenAIResponsesToolCall(
+        state,
+        index,
+        {
+          argumentsJson: argumentsDelta
+        },
+        true
+      );
+      const frames = ensureOpenAIResponsesRelayStarted(state);
+      if (!toolCall.added) {
+        frames.push(
+          encodeSseData({
+            type: 'response.output_item.added',
+            output_index: toolCall.outputIndex,
+            item: buildOpenAIResponsesFunctionCallItem(toolCall, 'in_progress')
+          })
+        );
+        toolCall.added = true;
+      }
+      if (argumentsDelta) {
+        frames.push(
+          encodeSseData({
+            type: 'response.function_call_arguments.delta',
+            output_index: toolCall.outputIndex,
+            item_id: toolCall.id,
+            delta: argumentsDelta
+          })
+        );
+        toolCall.emittedArgumentsLength = toolCall.argumentsJson.length;
+      }
+      return frames;
+    }
+  }
+
+  if (eventType === 'interaction.completed') {
+    const interaction = isObject(payload.interaction) ? payload.interaction : undefined;
+    const id = asString(interaction?.id);
+    const model = asString(interaction?.model) || asString(interaction?.agent);
+    if (id) {
+      state.responseId = id;
+    }
+    if (model) {
+      state.model = model;
+    }
+    updateOpenAIResponsesRelayUsageFromGeminiInteraction(state, interaction);
+    const status = asString(interaction?.status);
+    if (status) {
+      state.finishReason = status === 'requires_action' ? 'tool_use' : status;
+    }
+    return finalizeOpenAIResponsesRelay(state);
+  }
+
+  return [];
+}
+
+function emitOpenAIChatFramesFromGeminiInteractionEvent(
+  state: OpenAIChatRelayState,
+  payload: Record<string, unknown>,
+  sseEvent?: string
+): string[] {
+  const eventType = getGeminiInteractionStreamEventType(payload, sseEvent);
+  if (eventType === 'interaction.created') {
+    const interaction = isObject(payload.interaction) ? payload.interaction : undefined;
+    const id = asString(interaction?.id);
+    const model = asString(interaction?.model) || asString(interaction?.agent);
+    if (id) {
+      state.id = id;
+    }
+    if (model) {
+      state.model = model;
+    }
+    return ensureOpenAIChatRelayStarted(state);
+  }
+
+  if (eventType === 'step.start') {
+    const step = isObject(payload.step) ? payload.step : undefined;
+    if (asString(step?.type) !== 'function_call') {
+      return [];
+    }
+    const toolCall: PendingOpenAIChatAnthropicToolCall = {
+      blockIndex: asNumber(payload.index) ?? state.nextToolCallIndex,
+      toolIndex: state.nextToolCallIndex,
+      id: asString(step?.id) || `call_${randomUUID().replace(/-/g, '')}`,
+      name: asString(step?.name) || 'tool',
+      started: true
+    };
+    state.nextToolCallIndex += 1;
+    state.activeAnthropicToolCall = toolCall;
+    const frames = ensureOpenAIChatRelayStarted(state);
+    frames.push(buildOpenAIChatAnthropicToolDeltaFrame(state, toolCall, ''));
+    return frames;
+  }
+
+  if (eventType === 'step.delta') {
+    const delta = isObject(payload.delta) ? payload.delta : undefined;
+    const deltaType = asString(delta?.type);
+    if (deltaType === 'text') {
+      const text = extractGeminiInteractionDeltaText(delta);
+      return text ? [buildOpenAIChatRelayDeltaFrame(state, { content: text })] : [];
+    }
+    if (deltaType === 'thought_summary') {
+      const text = extractGeminiInteractionDeltaText(delta);
+      return text ? [buildOpenAIChatRelayDeltaFrame(state, { reasoning_content: text })] : [];
+    }
+    if (deltaType === 'arguments_delta') {
+      const args = asString(delta?.arguments) || '';
+      return args && state.activeAnthropicToolCall
+        ? [buildOpenAIChatAnthropicToolDeltaFrame(state, state.activeAnthropicToolCall, args)]
+        : [];
+    }
+  }
+
+  if (eventType === 'step.stop') {
+    const index = asNumber(payload.index);
+    if (
+      index !== undefined &&
+      state.activeAnthropicToolCall &&
+      state.activeAnthropicToolCall.blockIndex === index
+    ) {
+      state.activeAnthropicToolCall = undefined;
+    }
+    return [];
+  }
+
+  if (eventType === 'interaction.completed') {
+    const interaction = isObject(payload.interaction) ? payload.interaction : undefined;
+    updateOpenAIChatRelayUsageFromGeminiInteraction(state, interaction);
+    const status = asString(interaction?.status);
+    if (status) {
+      state.finishReason = status === 'requires_action' ? 'tool_use' : status;
+    }
+    return finalizeOpenAIChatRelay(state);
+  }
+
+  return [];
+}
+
+function emitAnthropicFramesFromGeminiInteractionEvent(
+  state: AnthropicRelayState,
+  payload: Record<string, unknown>,
+  sseEvent?: string
+): string[] {
+  state.sawGeminiInteractionsEvent = true;
+  const eventType = getGeminiInteractionStreamEventType(payload, sseEvent);
+  if (eventType === 'error') {
+    const error = extractGeminiInteractionError(payload);
+    state.finished = true;
+    return [emitAnthropicStreamErrorFrame(error.type, error.message)];
+  }
+
+  if (eventType === 'interaction.created') {
+    const interaction = isObject(payload.interaction) ? payload.interaction : undefined;
+    const id = asString(interaction?.id);
+    const model = asString(interaction?.model) || asString(interaction?.agent);
+    if (id) {
+      state.messageId = id;
+    }
+    if (model) {
+      state.model = model;
+    }
+    return ensureAnthropicRelayStartedForGeminiInteraction(state);
+  }
+
+  if (eventType === 'step.start') {
+    const step = isObject(payload.step) ? payload.step : undefined;
+    const stepType = asString(step?.type);
+    if (stepType === 'function_call') {
+      const index = asNumber(payload.index) ?? state.nextBlockIndex;
+      const toolCall: PendingAnthropicToolCall = {
+        index,
+        blockIndex: state.nextBlockIndex++,
+        id: asString(step?.id) || `toolu_${randomUUID().replace(/-/g, '')}`,
+        name: asString(step?.name) || 'tool',
+        argumentsJson: normalizeStreamToolArguments(step?.arguments),
+        emittedArgumentsLength: 0,
+        started: true,
+        closed: false
+      };
+      state.pendingToolCalls.set(index, toolCall);
+      const frames = ensureAnthropicRelayStartedForGeminiInteraction(state);
+      frames.push(buildAnthropicToolUseStartFrame(toolCall));
+      return frames;
+    }
+  }
+
+  if (eventType === 'step.delta') {
+    const delta = isObject(payload.delta) ? payload.delta : undefined;
+    const deltaType = asString(delta?.type);
+    if (deltaType === 'text') {
+      const text = extractGeminiInteractionDeltaText(delta);
+      if (!text) {
+        return [];
+      }
+      const frames = ensureAnthropicTextBlockStarted(state);
+      frames.push(
+        encodeSseEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index: state.activeBlockIndex,
+          delta: {
+            type: 'text_delta',
+            text
+          }
+        })
+      );
+      return frames;
+    }
+
+    if (deltaType === 'thought_summary') {
+      const thinking = extractGeminiInteractionDeltaText(delta);
+      if (!thinking) {
+        return [];
+      }
+      const frames = ensureAnthropicThinkingBlockStarted(state);
+      frames.push(
+        encodeSseEvent('content_block_delta', {
+          type: 'content_block_delta',
+          index: state.activeBlockIndex,
+          delta: {
+            type: 'thinking_delta',
+            thinking
+          }
+        })
+      );
+      return frames;
+    }
+
+    if (deltaType === 'arguments_delta') {
+      const index = asNumber(payload.index) ?? 0;
+      const toolCall = state.pendingToolCalls.get(index);
+      const partialJson = asString(delta?.arguments) || '';
+      if (!toolCall || !partialJson) {
+        return [];
+      }
+      toolCall.argumentsJson += partialJson;
+      toolCall.emittedArgumentsLength = toolCall.argumentsJson.length;
+      return [buildAnthropicToolUseDeltaFrame(toolCall.blockIndex, partialJson)];
+    }
+  }
+
+  if (eventType === 'step.stop') {
+    const index = asNumber(payload.index);
+    const toolCall = index !== undefined ? state.pendingToolCalls.get(index) : undefined;
+    if (toolCall && !toolCall.closed) {
+      toolCall.closed = true;
+      return [buildAnthropicContentBlockStopFrame(toolCall.blockIndex)];
+    }
+  }
+
+  if (eventType === 'interaction.completed') {
+    const interaction = isObject(payload.interaction) ? payload.interaction : undefined;
+    const frames = shouldReplayCompletedGeminiInteractionStepsToAnthropic(state, interaction)
+      ? emitAnthropicFramesFromCompletedGeminiInteractionSteps(state, interaction)
+      : [];
+    updateAnthropicRelayUsageFromGeminiInteraction(state, interaction);
+    const status = asString(interaction?.status);
+    if (status) {
+      state.finishReason = status === 'requires_action' ? 'tool_use' : status;
+    }
+    frames.push(...finalizeAnthropicRelay(state));
+    return frames;
+  }
+
+  return [];
+}
+
+function emitGeminiFramesFromGeminiInteractionEvent(
+  state: GeminiRelayState,
+  payload: Record<string, unknown>,
+  sseEvent?: string
+): string[] {
+  const eventType = getGeminiInteractionStreamEventType(payload, sseEvent);
+  if (eventType === 'interaction.created') {
+    const interaction = isObject(payload.interaction) ? payload.interaction : undefined;
+    const model = asString(interaction?.model) || asString(interaction?.agent);
+    if (model) {
+      state.model = model;
+    }
+    return [];
+  }
+
+  if (eventType === 'step.start') {
+    const step = isObject(payload.step) ? payload.step : undefined;
+    if (asString(step?.type) !== 'function_call') {
+      return [];
+    }
+    const index = asNumber(payload.index) ?? state.pendingToolCalls.size;
+    state.pendingToolCalls.set(index, {
+      index,
+      name: asString(step?.name) || 'tool',
+      argumentsJson: normalizeStreamToolArguments(step?.arguments)
+    });
+    return [];
+  }
+
+  if (eventType === 'step.delta') {
+    const delta = isObject(payload.delta) ? payload.delta : undefined;
+    const deltaType = asString(delta?.type);
+    if (deltaType === 'text') {
+      const text = extractGeminiInteractionDeltaText(delta);
+      if (!text) {
+        return [];
+      }
+      state.outputText += text;
+      state.emittedAnyDelta = true;
+      return [
+        encodeSseData({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ text }]
+              }
+            }
+          ],
+          modelVersion: state.model
+        })
+      ];
+    }
+    if (deltaType === 'arguments_delta') {
+      const index = asNumber(payload.index) ?? 0;
+      const toolCall = state.pendingToolCalls.get(index);
+      if (toolCall) {
+        toolCall.argumentsJson += asString(delta?.arguments) || '';
+      }
+    }
+    return [];
+  }
+
+  if (eventType === 'step.stop') {
+    const index = asNumber(payload.index);
+    const toolCall = index !== undefined ? state.pendingToolCalls.get(index) : undefined;
+    if (!toolCall) {
+      return [];
+    }
+    state.pendingToolCalls.delete(toolCall.index);
+    return [
+      encodeSseData({
+        candidates: [
+          {
+            content: {
+              role: 'model',
+              parts: [
+                {
+                  functionCall: {
+                    name: toolCall.name,
+                    args: parseStreamToolArguments(toolCall.argumentsJson)
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        modelVersion: state.model
+      })
+    ];
+  }
+
+  if (eventType === 'interaction.completed') {
+    const interaction = isObject(payload.interaction) ? payload.interaction : undefined;
+    updateGeminiRelayUsageFromGeminiInteraction(state, interaction);
+    const frame = buildGeminiFinalFrame(state);
+    return frame ? [frame] : [];
+  }
+
+  return [];
 }
 
 function collectOpenAINonStreamStateFromResponsesEvent(

@@ -208,6 +208,51 @@ export function parseGeminiGenerateContentRequest(
   });
 }
 
+export function parseGeminiInteractionsRequest(body: Record<string, unknown>): Result<StandardRequest> {
+  const inputResult = normalizeGeminiInteractionsInput(body.input);
+  if (!inputResult.ok) {
+    return inputResult;
+  }
+
+  const generationConfig = readRecordOption(body.generation_config ?? body.generationConfig);
+  const instructions = asString(body.system_instruction) || asString(body.systemInstruction);
+  const input = ensureInputWithInstructions(inputResult.value, instructions);
+  if (!input) {
+    return err('Gemini interactions request requires non-empty input or system_instruction.');
+  }
+
+  const agent = asString(body.agent);
+  const model = asString(body.model) || agent;
+  const toolChoice = readGeminiInteractionsToolChoice(body.tool_choice) ?? readToolChoice(body.tool_choice);
+
+  return ok({
+    model,
+    instructions,
+    input,
+    temperature: asNumber(generationConfig?.temperature),
+    top_p: asNumber(generationConfig?.top_p) ?? asNumber(generationConfig?.topP),
+    max_output_tokens: asNumber(generationConfig?.max_output_tokens) ?? asNumber(generationConfig?.maxOutputTokens),
+    stop: asStop(generationConfig?.stop_sequences ?? generationConfig?.stopSequences),
+    stream: asBoolean(body.stream),
+    tools: readTools(body.tools),
+    tool_choice: toolChoice,
+    gemini_interactions: {
+      ...(agent ? { agent } : {}),
+      ...(asString(body.previous_interaction_id) ? { previous_interaction_id: asString(body.previous_interaction_id) } : {}),
+      ...(asBoolean(body.store) !== undefined ? { store: asBoolean(body.store) } : {}),
+      ...(asBoolean(body.background) !== undefined ? { background: asBoolean(body.background) } : {}),
+      ...(body.response_format !== undefined ? { response_format: body.response_format } : {}),
+      ...(generationConfig ? { generation_config: generationConfig } : {}),
+      ...(body.agent_config !== undefined ? { agent_config: body.agent_config } : {}),
+      ...(body.response_modalities !== undefined ? { response_modalities: body.response_modalities } : {}),
+      ...(asString(body.service_tier) ? { service_tier: asString(body.service_tier) } : {}),
+      ...(body.environment !== undefined ? { environment: body.environment } : {}),
+      ...(asString(body.cached_content) ? { cached_content: asString(body.cached_content) } : {}),
+      ...(body.webhook_config !== undefined ? { webhook_config: body.webhook_config } : {})
+    }
+  });
+}
+
 export function readGeminiMetadata(
   input: SourceAdapterRequestInput,
   defaultAction: 'generateContent' | 'streamGenerateContent'
@@ -225,6 +270,14 @@ export function readGeminiMetadata(
 
   const apiVersion = input.source.metadata?.apiVersion || input.config.geminiApiVersion;
   return ok({ model, action, apiVersion });
+}
+
+export function readGeminiInteractionsMetadata(
+  input: SourceAdapterRequestInput
+): Result<{ apiVersion: string }> {
+  return ok({
+    apiVersion: input.source.metadata?.apiVersion || input.config.geminiApiVersion
+  });
 }
 
 function normalizeResponsesInput(input: unknown): Result<string | StandardRequestInputMessage[]> {
@@ -254,6 +307,269 @@ function normalizeResponsesInput(input: unknown): Result<string | StandardReques
   }
 
   return ok(coalesceResponsesInputMessages(messages));
+}
+
+function normalizeGeminiInteractionsInput(input: unknown): Result<string | StandardRequestInputMessage[]> {
+  if (typeof input === 'string') {
+    return ok(input.trim());
+  }
+
+  if (!Array.isArray(input)) {
+    if (isObject(input)) {
+      const message = normalizeGeminiInteractionInputItem(input);
+      if (!message) {
+        return err('Gemini interactions request contains invalid input item.');
+      }
+      return ok([message]);
+    }
+
+    return err('Gemini interactions request requires input.');
+  }
+
+  const messages: StandardRequestInputMessage[] = [];
+  const toolNamesById = new Map<string, string>();
+  for (const item of input) {
+    const message = normalizeGeminiInteractionInputItem(item, toolNamesById);
+    if (message) {
+      messages.push(message);
+    }
+  }
+
+  return ok(coalesceResponsesInputMessages(messages));
+}
+
+function normalizeGeminiInteractionInputItem(
+  item: unknown,
+  toolNamesById = new Map<string, string>()
+): StandardRequestInputMessage | null {
+  if (typeof item === 'string') {
+    const text = item.trim();
+    return text
+      ? {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text }]
+        }
+      : null;
+  }
+
+  if (!isObject(item)) {
+    return null;
+  }
+
+  const type = asString(item.type);
+  if (type === 'function_call') {
+    const name = asString(item.name);
+    if (!name) {
+      return null;
+    }
+    const id = asString(item.id) || asString(item.call_id) || `gemini_interaction_call_${name}`;
+    toolNamesById.set(id, name);
+    return {
+      type: 'message',
+      role: 'assistant',
+      content: [
+        {
+          type: 'tool_use',
+          id,
+          name,
+          input: normalizeFunctionArgumentsInput(item.arguments)
+        }
+      ]
+    };
+  }
+
+  if (type === 'function_result') {
+    const callId = asString(item.call_id) || asString(item.id);
+    if (!callId) {
+      return null;
+    }
+    const name = asString(item.name) || toolNamesById.get(callId);
+    const toolResult: StandardRequestInputContent = {
+      type: 'tool_result',
+      tool_use_id: callId,
+      ...(name ? { name } : {}),
+      content: normalizeGeminiInteractionResultContent(item.result)
+    };
+    return {
+      type: 'message',
+      role: 'user',
+      content: [toolResult]
+    };
+  }
+
+  if (type === 'thought') {
+    const text = asString(item.text) || asString(item.thought);
+    const summary =
+      normalizeGeminiInteractionThoughtSummary(item.summary) ||
+      normalizeGeminiInteractionThoughtSummary(item.thought_summary);
+    const signature = asString(item.signature);
+    if (!text && !summary && !signature) {
+      return null;
+    }
+    return {
+      type: 'message',
+      role: 'assistant',
+      content: [
+        {
+          type: 'reasoning',
+          ...(text ? { text } : {}),
+          ...(summary ? { summary } : {}),
+          ...(signature ? { encrypted_content: signature } : {}),
+          reasoning_details: [
+            ...(summary
+              ? [
+                  {
+                    type: 'reasoning.summary',
+                    summary,
+                    format: 'google-interactions-v1'
+                  }
+                ]
+              : []),
+            ...(text
+              ? [
+                  {
+                    type: 'reasoning.text',
+                    text,
+                    format: 'google-interactions-v1'
+                  }
+                ]
+              : []),
+            ...(signature
+              ? [
+                  {
+                    type: 'reasoning.encrypted',
+                    data: signature,
+                    format: 'google-interactions-v1'
+                  }
+                ]
+              : [])
+          ]
+        }
+      ]
+    };
+  }
+
+  if (type === 'model_output') {
+    const content = normalizeGeminiInteractionContent(item.content);
+    return content.length > 0
+      ? {
+          type: 'message',
+          role: 'assistant',
+          content
+        }
+      : null;
+  }
+
+  if (type === 'user_input') {
+    const content = normalizeGeminiInteractionContent(item.content);
+    return content.length > 0
+      ? {
+          type: 'message',
+          role: 'user',
+          content
+        }
+      : null;
+  }
+
+  if (type === 'text' || type === 'input_text' || type === 'output_text') {
+    const text = asString(item.text);
+    return text
+      ? {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text }]
+        }
+      : null;
+  }
+
+  if (item.content !== undefined || item.role !== undefined) {
+    const role = normalizeConversationRole(item.role);
+    const content = normalizeGeminiInteractionContent(item.content);
+    return content.length > 0
+      ? {
+          type: 'message',
+          role,
+          content
+        }
+      : null;
+  }
+
+  const serialized = stringifyUnknownInputItem(item);
+  return serialized
+    ? {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: serialized }]
+      }
+    : null;
+}
+
+function normalizeGeminiInteractionContent(content: unknown): StandardRequestInputContent[] {
+  if (typeof content === 'string') {
+    const text = content.trim();
+    return text ? [{ type: 'input_text', text }] : [];
+  }
+
+  const items = Array.isArray(content) ? content : content !== undefined ? [content] : [];
+  const normalized: StandardRequestInputContent[] = [];
+  for (const item of items) {
+    const text = extractTextFromPart(item);
+    if (text) {
+      normalized.push({
+        type: 'input_text',
+        text
+      });
+      continue;
+    }
+
+    if (isObject(item)) {
+      const serialized = stringifyUnknownInputItem(item);
+      if (serialized) {
+        normalized.push({
+          type: 'input_text',
+          text: serialized
+        });
+      }
+    }
+  }
+
+  return normalized;
+}
+
+function normalizeGeminiInteractionThoughtSummary(value: unknown): string {
+  if (typeof value === 'string') {
+    return value.trim();
+  }
+
+  const items = Array.isArray(value) ? value : value !== undefined ? [value] : [];
+  return items
+    .map((item) => extractTextFromPart(item))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function normalizeGeminiInteractionResultContent(result: unknown): string {
+  if (typeof result === 'string') {
+    return result;
+  }
+
+  if (Array.isArray(result)) {
+    const text = result.map(extractTextFromPart).filter(Boolean).join('\n').trim();
+    if (text) {
+      return text;
+    }
+  }
+
+  if (isObject(result)) {
+    const text = extractTextFromPart(result);
+    if (text) {
+      return text;
+    }
+  }
+
+  return normalizeToolResultContent(result);
 }
 
 function coalesceResponsesInputMessages(messages: StandardRequestInputMessage[]): StandardRequestInputMessage[] {
@@ -1394,6 +1710,52 @@ function readGeminiToolChoice(value: unknown): unknown {
   return undefined;
 }
 
+function readGeminiInteractionsToolChoice(value: unknown): unknown {
+  if (typeof value === 'string') {
+    if (value === 'any') {
+      return 'required';
+    }
+    if (value === 'none' || value === 'auto' || value === 'validated') {
+      return value;
+    }
+    return undefined;
+  }
+
+  if (!isObject(value)) {
+    return undefined;
+  }
+
+  const allowedTools = isObject(value.allowed_tools)
+    ? value.allowed_tools
+    : isObject(value.allowedTools)
+      ? value.allowedTools
+      : undefined;
+  if (!allowedTools) {
+    return undefined;
+  }
+
+  const mode = asString(allowedTools.mode);
+  const tools = Array.isArray(allowedTools.tools)
+    ? allowedTools.tools.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    : [];
+  if (tools.length === 1) {
+    return {
+      type: 'function',
+      function: {
+        name: tools[0]
+      }
+    };
+  }
+  if (mode === 'any') {
+    return 'required';
+  }
+  if (mode === 'auto' || mode === 'none' || mode === 'validated') {
+    return mode;
+  }
+
+  return undefined;
+}
+
 function readGeminiAllowedFunctionNames(functionCallingConfig: Record<string, unknown>): string[] {
   const rawNames = Array.isArray(functionCallingConfig.allowedFunctionNames)
     ? functionCallingConfig.allowedFunctionNames
@@ -1446,6 +1808,10 @@ function readReasoningSplitOption(body: Record<string, unknown>): boolean | unde
 
 function readOptionalRequestOption(value: unknown): unknown | undefined {
   return value === undefined ? undefined : value;
+}
+
+function readRecordOption(value: unknown): Record<string, unknown> | undefined {
+  return isObject(value) ? value : undefined;
 }
 
 function readToolChoice(value: unknown): unknown {

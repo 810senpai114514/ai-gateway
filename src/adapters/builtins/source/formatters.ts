@@ -121,6 +121,27 @@ export function formatGeminiGenerateContentResponse(response: StandardResponse):
   };
 }
 
+export function formatGeminiInteractionsResponse(response: StandardResponse): Record<string, unknown> {
+  const steps = collectGeminiInteractionSteps(response);
+  const usage: Record<string, unknown> = {
+    total_input_tokens: response.usage.input_tokens,
+    total_output_tokens: response.usage.output_tokens,
+    total_tokens: response.usage.total_tokens,
+    total_cached_tokens: response.usage.cache_read_tokens
+  };
+
+  return {
+    id: response.id,
+    model: response.model,
+    status: response.output.some((item) => item.type === 'function_call') ? 'requires_action' : response.status,
+    object: 'interaction',
+    created: new Date().toISOString(),
+    updated: new Date().toISOString(),
+    steps,
+    usage
+  };
+}
+
 function collectOpenAIChatToolCalls(response: StandardResponse): Array<Record<string, unknown>> {
   const toolCalls: Array<Record<string, unknown>> = [];
   for (const item of response.output) {
@@ -203,6 +224,66 @@ function collectGeminiParts(response: StandardResponse): Array<Record<string, un
   }
 
   return parts;
+}
+
+function collectGeminiInteractionSteps(response: StandardResponse): Array<Record<string, unknown>> {
+  const steps: Array<Record<string, unknown>> = [];
+  for (const item of response.output) {
+    if (item.type === 'reasoning') {
+      const summary = item.summary.map((entry) => entry.text).filter(Boolean).join('\n').trim();
+      const text = collectReasoningText(item);
+      const thoughtSummary = [summary, text].filter(Boolean).join('\n').trim();
+      if (thoughtSummary || item.encrypted_content) {
+        steps.push({
+          type: 'thought',
+          ...(thoughtSummary ? { summary: geminiInteractionTextContent(thoughtSummary) } : {}),
+          ...(item.encrypted_content ? { signature: item.encrypted_content } : {})
+        });
+      }
+      continue;
+    }
+
+    if (item.type === 'message') {
+      const content: Array<Record<string, unknown>> = [];
+      for (const entry of item.content) {
+        if (entry.type === 'output_text' && entry.text) {
+          content.push({ type: 'text', text: entry.text });
+        }
+      }
+      if (content.length > 0) {
+        steps.push({
+          type: 'model_output',
+          content
+        });
+      }
+      continue;
+    }
+
+    steps.push({
+      type: 'function_call',
+      id: item.call_id || item.id,
+      name: item.name,
+      arguments: parseFunctionArguments(item.arguments)
+    });
+  }
+
+  return steps.length > 0
+    ? steps
+    : [
+        {
+          type: 'model_output',
+          content: [{ type: 'text', text: '' }]
+        }
+      ];
+}
+
+function geminiInteractionTextContent(text: string): Array<Record<string, unknown>> {
+  return [
+    {
+      type: 'text',
+      text
+    }
+  ];
 }
 
 function formatAnthropicThinkingBlocks(item: StandardResponseReasoning): Array<Record<string, unknown>> {

@@ -48,6 +48,7 @@ import {
 import {
   canRelayOptimisticOpenAIChatStream,
   collectAnthropicNonStreamPayloadFromEventStream,
+  collectGeminiInteractionsNonStreamPayloadFromEventStream,
   collectOpenAINonStreamPayloadFromEventStream,
   createOptimisticOpenAIChatStreamRelay,
   finalizeOptimisticOpenAIChatStreamRelay,
@@ -893,10 +894,13 @@ export async function handleGatewayRequest(
         targetProviderName: targetProviderConfig?.name,
         mode: 'buffered'
       });
-      const upstreamPayload =
-        isEventStreamResponse(upstreamResponse) && targetProvider === 'openai'
-          ? await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal)
-          : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse, clientAbortSignal);
+      const upstreamPayload = await readBufferedUpstreamPayload(
+        request,
+        targetProvider,
+        targetProviderConfig,
+        upstreamResponse,
+        clientAbortSignal
+      );
       if (clientAbortSignal.aborted) {
         return;
       }
@@ -1147,10 +1151,13 @@ export async function handleGatewayRequest(
     upstreamAttemptSequence += 1;
     const currentAttemptSequence = upstreamAttemptSequence;
 
-    const upstreamPayload =
-      isEventStreamResponse(upstreamResponse) && targetProvider === 'openai'
-        ? await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal)
-        : await safeReadUpstreamPayload(request, targetProvider, upstreamResponse, clientAbortSignal);
+    const upstreamPayload = await readBufferedUpstreamPayload(
+      request,
+      targetProvider,
+      targetProviderConfig,
+      upstreamResponse,
+      clientAbortSignal
+    );
     if (clientAbortSignal.aborted) {
       return;
     }
@@ -1585,18 +1592,13 @@ async function runTransparentToolExecutionLoop(input: {
     lastAttemptSequence = upstreamAttemptSequence;
     completedModelTurns += 1;
 
-    const upstreamPayload =
-      isEventStreamResponse(upstreamResponse) && input.targetProvider === 'openai'
-        ? await collectOpenAINonStreamPayloadFromEventStream(
-            upstreamResponse,
-            input.providerPluginContext.clientAbortSignal
-          )
-        : await safeReadUpstreamPayload(
-            input.request,
-            input.targetProvider,
-            upstreamResponse,
-            input.providerPluginContext.clientAbortSignal
-          );
+    const upstreamPayload = await readBufferedUpstreamPayload(
+      input.request,
+      input.targetProvider,
+      input.targetProviderConfig,
+      upstreamResponse,
+      input.providerPluginContext.clientAbortSignal
+    );
     if (input.providerPluginContext.clientAbortSignal?.aborted) {
       return { ok: false, upstreamAttemptSequence };
     }
@@ -2110,6 +2112,7 @@ async function handleVirtualModelRequest(
           ? await collectVirtualModelEventStreamPayload(
               request,
               targetProvider,
+              targetProviderConfig,
               upstreamResponse,
               clientAbortSignal
             )
@@ -5059,6 +5062,7 @@ async function tryAttachBillingHeadersFromUpstreamResponse(
   try {
     upstreamPayload = await collectBillingPayloadFromUpstreamResponse(
       targetProvider,
+      targetProviderConfig,
       upstreamResponse.clone(),
       clientAbortSignal
     );
@@ -5250,6 +5254,7 @@ async function tryPublishStreamingBillingEventFromUpstreamResponse(
   try {
     upstreamPayload = await collectBillingPayloadFromUpstreamResponse(
       targetProvider,
+      targetProviderConfig,
       upstreamResponse,
       clientAbortSignal
     );
@@ -5682,6 +5687,7 @@ function normalizeBillingDurationSeconds(value: number): number | undefined {
 
 async function collectBillingPayloadFromUpstreamResponse(
   targetProvider: Provider,
+  targetProviderConfig: ProviderConfig | undefined,
   upstreamResponse: Response,
   clientAbortSignal?: AbortSignal
 ): Promise<unknown> {
@@ -5695,6 +5701,10 @@ async function collectBillingPayloadFromUpstreamResponse(
 
   if (targetProvider === 'anthropic') {
     return await collectAnthropicNonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
+  }
+
+  if (targetProvider === 'gemini' && targetProviderConfig?.type === 'gemini_interactions') {
+    return await collectGeminiInteractionsNonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
   }
 
   return await readUpstreamPayload(upstreamResponse, clientAbortSignal);
@@ -5964,9 +5974,32 @@ async function safeReadUpstreamPayload(
   }
 }
 
+async function readBufferedUpstreamPayload(
+  request: FastifyRequest,
+  provider: Provider,
+  providerConfig: ProviderConfig | undefined,
+  upstreamResponse: Response,
+  clientAbortSignal?: AbortSignal
+): Promise<unknown> {
+  if (!isEventStreamResponse(upstreamResponse)) {
+    return await safeReadUpstreamPayload(request, provider, upstreamResponse, clientAbortSignal);
+  }
+
+  if (provider === 'openai') {
+    return await collectOpenAINonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
+  }
+
+  if (provider === 'gemini' && providerConfig?.type === 'gemini_interactions') {
+    return await collectGeminiInteractionsNonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
+  }
+
+  return await safeReadUpstreamPayload(request, provider, upstreamResponse, clientAbortSignal);
+}
+
 async function collectVirtualModelEventStreamPayload(
   request: FastifyRequest,
   provider: Provider,
+  providerConfig: ProviderConfig | undefined,
   upstreamResponse: Response,
   clientAbortSignal?: AbortSignal
 ): Promise<unknown> {
@@ -5977,6 +6010,10 @@ async function collectVirtualModelEventStreamPayload(
 
     if (provider === 'anthropic') {
       return await collectAnthropicNonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
+    }
+
+    if (provider === 'gemini' && providerConfig?.type === 'gemini_interactions') {
+      return await collectGeminiInteractionsNonStreamPayloadFromEventStream(upstreamResponse, clientAbortSignal);
     }
   } catch (error) {
     if (clientAbortSignal?.aborted) {
@@ -6206,7 +6243,16 @@ function resolvePassthroughModel(body: Record<string, unknown>, source: GatewayS
   }
 
   const model = body.model;
-  return typeof model === 'string' && model.trim() ? model.trim() : undefined;
+  if (typeof model === 'string' && model.trim()) {
+    return model.trim();
+  }
+
+  if (source.adapterKey === 'gemini_interactions') {
+    const agent = body.agent;
+    return typeof agent === 'string' && agent.trim() ? agent.trim() : undefined;
+  }
+
+  return undefined;
 }
 
 function applyPassthroughModelOverride(
@@ -6219,6 +6265,20 @@ function applyPassthroughModelOverride(
   }
 
   if (provider === 'gemini') {
+    if (isGeminiInteractionsUrl(request.url) && isPlainObject(request.body)) {
+      const body = { ...request.body };
+      if (typeof body.agent === 'string' && !body.model) {
+        body.agent = model;
+      } else {
+        body.model = model;
+      }
+
+      return {
+        ...request,
+        body
+      };
+    }
+
     return {
       ...request,
       url: replaceGeminiModelInUrl(request.url, model)
@@ -6236,6 +6296,14 @@ function applyPassthroughModelOverride(
       model
     }
   };
+}
+
+function isGeminiInteractionsUrl(url: string): boolean {
+  try {
+    return /\/interactions$/.test(new URL(url).pathname);
+  } catch {
+    return /\/interactions(?:\?|$)/.test(url);
+  }
 }
 
 function replaceGeminiModelInUrl(url: string, model: string): string {
@@ -7537,6 +7605,26 @@ function canRelayLiveConvertedStream(
     return true;
   }
 
+  if (
+    targetProvider === 'gemini' &&
+    targetProviderConfig?.type === 'gemini_interactions' &&
+    (
+      source.adapterKey === 'openai_responses' ||
+      source.adapterKey === 'openai_chat' ||
+      source.adapterKey === 'anthropic_messages' ||
+      source.adapterKey === 'gemini_stream'
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    source.adapterKey === 'gemini_interactions' &&
+    (targetProvider === 'openai' || targetProvider === 'anthropic')
+  ) {
+    return true;
+  }
+
   return false;
 }
 
@@ -7548,6 +7636,23 @@ function canPassthroughWithoutProtocolConversion(
 ): boolean {
   if (sourceProvider !== targetProvider) {
     return false;
+  }
+
+  if (sourceProvider === 'gemini') {
+    const targetProtocol = targetProviderConfig?.type;
+    if (!targetProtocol) {
+      return true;
+    }
+
+    if (sourceAdapterKey === 'gemini_interactions') {
+      return targetProtocol === 'gemini_interactions';
+    }
+
+    if (sourceAdapterKey === 'gemini_generate' || sourceAdapterKey === 'gemini_stream') {
+      return targetProtocol === 'gemini_generate_content';
+    }
+
+    return true;
   }
 
   if (sourceProvider !== 'openai') {

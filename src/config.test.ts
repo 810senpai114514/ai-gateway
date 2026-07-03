@@ -190,6 +190,28 @@ describe('Gateway config providerPlugins', () => {
     });
   });
 
+  it('parses Gemini Interactions provider type aliases', () => {
+    const config = parseGatewayConfigFromRaw({
+      providers: [
+        {
+          name: 'google-interactions',
+          type: 'google-interactions',
+          models: ['gemini-2.5-flash']
+        },
+        {
+          name: 'gemini-interactions',
+          type: 'gemini_interactions',
+          models: ['gemini-2.5-pro']
+        }
+      ]
+    });
+
+    expect(config.providers.map((provider) => provider.type)).toEqual([
+      'gemini_interactions',
+      'gemini_interactions'
+    ]);
+  });
+
   it('keeps gateway scheduling disabled by default', () => {
     const config = parseGatewayConfigFromRaw({});
 

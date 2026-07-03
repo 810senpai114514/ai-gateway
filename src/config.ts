@@ -4052,6 +4052,17 @@ function parseProviderTypeToken(value: string | undefined): ProviderType | undef
   }
 
   if (
+    normalized === 'gemini_interactions' ||
+    normalized === 'gemini-interactions' ||
+    normalized === 'google_interactions' ||
+    normalized === 'google-interactions' ||
+    normalized === 'interactions' ||
+    normalized === 'interaction'
+  ) {
+    return 'gemini_interactions';
+  }
+
+  if (
     normalized === 'gemini_generate_content' ||
     normalized === 'gemini-generate-content' ||
     normalized === 'generate_content' ||

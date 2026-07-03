@@ -5,7 +5,8 @@ export type ProviderType =
   | 'openai_responses'
   | 'openai_chat_completions'
   | 'anthropic_messages'
-  | 'gemini_generate_content';
+  | 'gemini_generate_content'
+  | 'gemini_interactions';
 
 export interface BillingTier {
   upToTokens?: number;
@@ -862,6 +863,7 @@ export type StandardRequestInputContent =
   | {
       type: 'tool_result';
       tool_use_id: string;
+      name?: string;
       content: string;
       is_error?: boolean;
       result_format?: 'function' | 'web_search';
@@ -892,6 +894,21 @@ export interface GatewayRequestClientContext {
   traceparent?: string;
   tracestate?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface StandardGeminiInteractionsOptions {
+  agent?: string;
+  previous_interaction_id?: string;
+  store?: boolean;
+  background?: boolean;
+  response_format?: unknown;
+  generation_config?: Record<string, unknown>;
+  agent_config?: unknown;
+  response_modalities?: unknown;
+  service_tier?: string;
+  environment?: unknown;
+  cached_content?: string;
+  webhook_config?: unknown;
 }
 
 export interface GatewayRequestTraceSnapshot {
@@ -927,6 +944,7 @@ export interface StandardRequest {
   reasoning?: unknown;
   thinking?: unknown;
   output_config?: unknown;
+  gemini_interactions?: StandardGeminiInteractionsOptions;
 }
 
 export interface SourceAdapterRequestInput {

@@ -135,6 +135,21 @@ export function registerGatewayRoutes(
     }
   );
 
+  fastify.post('/v1beta/interactions', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+    return handleGatewayRequest(
+      request,
+      reply,
+      {
+        adapterKey: 'gemini_interactions',
+        metadata: {
+          apiVersion: 'v1beta'
+        }
+      },
+      config,
+      runtime
+    );
+  });
+
   fastify.post<{ Params: { '*': string } }>(
     '/v1/models/*',
     { preHandler: gatewayWritePreHandlers },
@@ -142,6 +157,21 @@ export function registerGatewayRoutes(
       return handleGeminiRequest(request, reply, 'v1', config, runtime);
     }
   );
+
+  fastify.post('/v1/interactions', { preHandler: gatewayWritePreHandlers }, async (request, reply) => {
+    return handleGatewayRequest(
+      request,
+      reply,
+      {
+        adapterKey: 'gemini_interactions',
+        metadata: {
+          apiVersion: 'v1'
+        }
+      },
+      config,
+      runtime
+    );
+  });
 }
 
 function handleGetGatewayModel(rawModelId: string, reply: FastifyReply, config: GatewayConfig) {
