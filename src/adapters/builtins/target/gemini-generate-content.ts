@@ -5,6 +5,14 @@ import { buildGeminiUrl } from '../common';
 import { parseGeminiToStandardResponse } from './shared';
 import { flattenStandardTools, mapStandardToolNameToTargetName, mapToolChoiceFunctionName } from './tools';
 
+const geminiSchemaStringKeys = new Set(['description', 'format', 'title']);
+const geminiSchemaNumberKeys = new Set(['maximum', 'minimum', 'maxItems', 'minItems']);
+const geminiSchemaArrayKeys = new Set(['enum', 'required', 'propertyOrdering']);
+
+interface GeminiContentConversionState {
+  toolNamesById: Map<string, string>;
+}
+
 export const geminiGenerateContentTargetAdapter: TargetAdapter = {
   provider: 'gemini',
   buildRequestFromStandard(input) {
@@ -92,31 +100,55 @@ function standardInputToGeminiContents(
   input: string | StandardRequestInputMessage[],
   tools?: unknown[]
 ): Array<Record<string, unknown>> {
+  const state: GeminiContentConversionState = {
+    toolNamesById: new Map()
+  };
+
   return collectStandardInputMessages(input).map((message) => ({
     role: message.role === 'assistant' ? 'model' : 'user',
-    parts: standardContentToGeminiParts(message.content, tools)
+    parts: standardContentToGeminiParts(message.content, tools, state)
   }));
 }
 
 function standardContentToGeminiParts(
   content: StandardRequestInputContent[],
-  tools?: unknown[]
+  tools: unknown[] | undefined,
+  state: GeminiContentConversionState
 ): Array<Record<string, unknown>> {
   const parts: Array<Record<string, unknown>> = [];
-  const text = content
-    .map((item) => (item.type === 'input_text' ? item.text : ''))
-    .filter(Boolean)
-    .join('\n')
-    .trim();
-  if (text) {
-    parts.push({ text });
-  }
+  const pendingText: string[] = [];
+  const flushText = () => {
+    const text = pendingText.join('\n').trim();
+    pendingText.length = 0;
+    if (text) {
+      parts.push({ text });
+    }
+  };
 
   for (const item of content) {
+    if (item.type === 'input_text') {
+      if (item.text.trim()) {
+        pendingText.push(item.text);
+      }
+      continue;
+    }
+
+    flushText();
+
+    if (item.type === 'reasoning') {
+      const reasoningPart = standardReasoningToGeminiThoughtPart(item);
+      if (reasoningPart) {
+        parts.push(reasoningPart);
+      }
+      continue;
+    }
+
     if (item.type === 'tool_use') {
+      const targetName = mapStandardToolNameToTargetName(item.name, tools);
+      state.toolNamesById.set(item.id, targetName);
       parts.push({
         functionCall: {
-          name: mapStandardToolNameToTargetName(item.name, tools),
+          name: targetName,
           args: normalizeGeminiFunctionCallArgs(item.input)
         }
       });
@@ -134,24 +166,73 @@ function standardContentToGeminiParts(
       continue;
     }
 
+    const response: Record<string, unknown> = {
+      content: item.content
+    };
+    if (item.is_error !== undefined) {
+      response.is_error = item.is_error;
+    }
+
     parts.push({
       functionResponse: {
-        name: item.tool_use_id,
-        response: {
-          content: item.content
-        }
+        name:
+          state.toolNamesById.get(item.tool_use_id) ??
+          mapStandardToolNameToTargetName(item.tool_use_id, tools),
+        response
       }
     });
   }
 
+  flushText();
+
   return parts.length > 0 ? parts : [{ text: '' }];
+}
+
+function standardReasoningToGeminiThoughtPart(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+): Record<string, unknown> | undefined {
+  const text = standardReasoningText(item);
+  return text ? { text, thought: true } : undefined;
+}
+
+function standardReasoningText(
+  item: Extract<StandardRequestInputContent, { type: 'reasoning' }>
+): string {
+  const directText = [item.text, item.summary].filter(Boolean).join('\n').trim();
+  if (directText) {
+    return directText;
+  }
+
+  if (!Array.isArray(item.reasoning_details)) {
+    return '';
+  }
+
+  return item.reasoning_details
+    .map((detail) => {
+      if (typeof detail === 'string') {
+        return detail;
+      }
+      if (!isPlainRecord(detail)) {
+        return '';
+      }
+      return (
+        asString(detail.thinking) ||
+        asString(detail.text) ||
+        asString(detail.reasoning) ||
+        asString(detail.summary) ||
+        ''
+      );
+    })
+    .filter(Boolean)
+    .join('\n')
+    .trim();
 }
 
 function mapStandardToolsToGeminiTools(tools: unknown[] | undefined): Record<string, unknown>[] | undefined {
   const functionDeclarations = flattenStandardTools(tools).map((tool) => {
     const declaration: Record<string, unknown> = {
       name: tool.targetName,
-      parameters: tool.parameters
+      parameters: sanitizeGeminiFunctionParameters(tool.parameters)
     };
     if (tool.description) {
       declaration.description = tool.description;
@@ -161,6 +242,151 @@ function mapStandardToolsToGeminiTools(tools: unknown[] | undefined): Record<str
   });
 
   return functionDeclarations.length > 0 ? [{ functionDeclarations }] : undefined;
+}
+
+function sanitizeGeminiFunctionParameters(value: unknown): Record<string, unknown> {
+  const sanitized = sanitizeGeminiSchema(value);
+  return isPlainRecord(sanitized) ? sanitized : { type: 'object', properties: {} };
+}
+
+function sanitizeGeminiSchema(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => sanitizeGeminiSchema(item))
+      .filter((item) => item !== undefined);
+  }
+
+  if (!isPlainRecord(value)) {
+    return value;
+  }
+
+  const output: Record<string, unknown> = {};
+
+  for (const [key, rawValue] of Object.entries(value)) {
+    if (key === 'type') {
+      assignGeminiSchemaType(output, rawValue);
+      continue;
+    }
+
+    if (key === 'properties') {
+      const properties = sanitizeGeminiSchemaProperties(rawValue);
+      if (properties) {
+        output.properties = properties;
+      }
+      continue;
+    }
+
+    if (key === 'items') {
+      const items = sanitizeGeminiSchemaItems(rawValue);
+      if (items) {
+        output.items = items;
+      }
+      continue;
+    }
+
+    if (key === 'anyOf' || key === 'any_of') {
+      const anyOf = sanitizeGeminiSchemaArray(rawValue);
+      if (anyOf) {
+        output[key] = anyOf;
+      }
+      continue;
+    }
+
+    if (key === 'nullable') {
+      if (typeof rawValue === 'boolean') {
+        output.nullable = rawValue;
+      }
+      continue;
+    }
+
+    if (key === 'const') {
+      if (typeof rawValue === 'string') {
+        output.enum = [rawValue];
+      }
+      continue;
+    }
+
+    if (geminiSchemaStringKeys.has(key)) {
+      if (typeof rawValue === 'string') {
+        output[key] = rawValue;
+      }
+      continue;
+    }
+
+    if (geminiSchemaNumberKeys.has(key)) {
+      if (typeof rawValue === 'number' && Number.isFinite(rawValue)) {
+        output[key] = rawValue;
+      }
+      continue;
+    }
+
+    if (geminiSchemaArrayKeys.has(key)) {
+      if (Array.isArray(rawValue)) {
+        output[key] = rawValue;
+      }
+      continue;
+    }
+  }
+
+  return output;
+}
+
+function assignGeminiSchemaType(target: Record<string, unknown>, value: unknown): void {
+  if (typeof value === 'string') {
+    target.type = value;
+    return;
+  }
+
+  if (!Array.isArray(value)) {
+    return;
+  }
+
+  const types = value.filter((item): item is string => typeof item === 'string');
+  const nonNullTypes = types.filter((item) => item.toLowerCase() !== 'null');
+  if (types.length !== nonNullTypes.length) {
+    target.nullable = true;
+  }
+  if (nonNullTypes.length > 0) {
+    target.type = nonNullTypes[0];
+  }
+}
+
+function sanitizeGeminiSchemaProperties(value: unknown): Record<string, unknown> | undefined {
+  if (!isPlainRecord(value)) {
+    return undefined;
+  }
+
+  const properties: Record<string, unknown> = {};
+  for (const [name, schema] of Object.entries(value)) {
+    const sanitized = sanitizeGeminiSchema(schema);
+    if (isPlainRecord(sanitized)) {
+      properties[name] = sanitized;
+    }
+  }
+
+  return Object.keys(properties).length > 0 ? properties : undefined;
+}
+
+function sanitizeGeminiSchemaItems(value: unknown): Record<string, unknown> | undefined {
+  const candidate = Array.isArray(value) ? value[0] : value;
+  const sanitized = sanitizeGeminiSchema(candidate);
+  return isPlainRecord(sanitized) ? sanitized : undefined;
+}
+
+function sanitizeGeminiSchemaArray(value: unknown): unknown[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const items = value
+    .map((item) => sanitizeGeminiSchema(item))
+    .filter((item) => isPlainRecord(item));
+
+  return items.length > 0 ? items : undefined;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return isObject(value) && !Array.isArray(value);
 }
 
 function mapStandardToolChoiceToGeminiToolConfig(

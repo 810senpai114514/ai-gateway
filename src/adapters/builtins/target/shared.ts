@@ -137,10 +137,12 @@ export function parseGeminiToStandardResponse(payload: unknown): Result<Standard
   const first = isObject(candidates[0]) ? candidates[0] : undefined;
   const content = isObject(first?.content) ? first.content : undefined;
   const parts = Array.isArray(content?.parts) ? content.parts : [];
-  const text = parts.map(extractTextFromPart).filter(Boolean).join('\n').trim();
+  const text = extractGeminiText(parts);
+  const toolCalls = extractGeminiFunctionCalls(parts);
+  const reasoningItems = extractGeminiReasoningItems(parts);
 
-  if (!text) {
-    return err('Gemini response does not contain text output.');
+  if (!text && toolCalls.length === 0 && reasoningItems.length === 0) {
+    return err('Gemini response does not contain text output, reasoning output, or tool calls.');
   }
 
   const usageRaw = isObject(payload.usageMetadata) ? payload.usageMetadata : undefined;
@@ -156,8 +158,9 @@ export function parseGeminiToStandardResponse(payload: unknown): Result<Standard
     id: `gem_${randomUUID()}`,
     model: asString(payload.modelVersion) || 'unknown',
     outputText: text,
+    outputItems: buildStandardResponseOutputItems(text, toolCalls, reasoningItems),
     usage,
-    finishReason: asString(first?.finishReason)
+    finishReason: toolCalls.length > 0 ? 'tool_use' : asString(first?.finishReason)
   }));
 }
 
@@ -744,6 +747,96 @@ function extractAnthropicReasoningItems(content: unknown): StandardResponseReaso
   }
 
   return [reasoning];
+}
+
+function extractGeminiText(parts: unknown[]): string {
+  return parts
+    .map((part) => {
+      if (!isObject(part) || asBoolean(part.thought) === true) {
+        return '';
+      }
+
+      return extractTextFromPart(part);
+    })
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+}
+
+function extractGeminiFunctionCalls(parts: unknown[]): StandardResponseFunctionCall[] {
+  const toolCalls: StandardResponseFunctionCall[] = [];
+  for (const part of parts) {
+    if (!isObject(part)) {
+      continue;
+    }
+
+    const functionCall = isObject(part.functionCall)
+      ? part.functionCall
+      : isObject(part.function_call)
+        ? part.function_call
+        : undefined;
+    if (!functionCall) {
+      continue;
+    }
+
+    const name = asString(functionCall.name);
+    if (!name) {
+      continue;
+    }
+
+    const id = asString(functionCall.id) || `gemini_call_${randomUUID().replace(/-/g, '')}`;
+    toolCalls.push({
+      id,
+      type: 'function_call',
+      call_id: id,
+      name,
+      arguments: normalizeFunctionCallArguments(functionCall.args ?? functionCall.arguments),
+      status: 'completed'
+    });
+  }
+
+  return toolCalls;
+}
+
+function extractGeminiReasoningItems(parts: unknown[]): StandardResponseReasoning[] {
+  const reasoningContent: NonNullable<StandardResponseReasoning['content']> = [];
+  const reasoningDetails: unknown[] = [];
+
+  for (const part of parts) {
+    if (!isObject(part) || asBoolean(part.thought) !== true) {
+      continue;
+    }
+
+    const text = extractTextFromPart(part);
+    if (!text) {
+      continue;
+    }
+
+    reasoningContent.push({
+      type: 'reasoning_text',
+      text
+    });
+    reasoningDetails.push({
+      type: 'reasoning.text',
+      text,
+      format: 'google-gemini-v1'
+    });
+  }
+
+  if (reasoningContent.length === 0 && reasoningDetails.length === 0) {
+    return [];
+  }
+
+  return [
+    {
+      id: `rs_${randomUUID().replace(/-/g, '')}`,
+      type: 'reasoning',
+      status: 'completed',
+      summary: [],
+      content: reasoningContent,
+      reasoning_details: reasoningDetails
+    }
+  ];
 }
 
 function normalizeFunctionCallArguments(value: unknown): string {

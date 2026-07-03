@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildOpenAIHeaders, normalizeOpenAIResponsesUsage } from './common';
+import { buildGeminiUrl, buildOpenAIHeaders, normalizeOpenAIResponsesUsage } from './common';
 
 describe('buildOpenAIHeaders', () => {
   it('uses x-api-key when authorization header is missing', () => {
@@ -123,6 +123,31 @@ describe('buildOpenAIHeaders', () => {
         process.env.OPENAI_API_KEY = previousOpenAIKey;
       }
     }
+  });
+});
+
+describe('buildGeminiUrl', () => {
+  it('drops non-Gemini query parameters when constructing upstream URLs', () => {
+    const result = buildGeminiUrl(
+      {
+        url: '/v1/messages?beta=tools-2024-04-04&target_provider=gemini-main&alt=sse',
+        headers: {}
+      } as never,
+      'gemini-2.5-pro',
+      'generateContent',
+      'v1beta',
+      {
+        geminiApiKey: 'sk-test',
+        geminiBaseUrl: 'https://mock.local'
+      } as never
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+
+    expect(result.value).toBe('https://mock.local/v1beta/models/gemini-2.5-pro:generateContent?alt=sse&key=sk-test');
   });
 });
 

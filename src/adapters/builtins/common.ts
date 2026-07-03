@@ -4,6 +4,7 @@ import { err, ok } from '../../types';
 import { asNumber, isObject, readBearerToken, readHeader } from '../../utils';
 
 const defaultAnthropicVersion = '2023-06-01';
+const geminiPassthroughQueryParams = new Set(['alt', 'fields', 'prettyPrint', 'quotaUser', 'userIp']);
 type OpenAIHeaderBuildConfig = Pick<GatewayConfig, 'openaiApiKey' | 'auth'> & {
   allowEnvApiKeyFallback?: boolean;
 };
@@ -83,16 +84,21 @@ export function buildGeminiUrl(
   config: GatewayConfig
 ): Result<string> {
   const incomingUrl = new URL(request.url, 'http://gateway.local');
-  const query = new URLSearchParams(incomingUrl.search);
+  const incomingQuery = new URLSearchParams(incomingUrl.search);
+  const query = new URLSearchParams();
 
-  const keyFromQuery = query.get('key');
+  const keyFromQuery = incomingQuery.get('key');
   const key = keyFromQuery || config.geminiApiKey || process.env.GEMINI_API_KEY;
   if (!key) {
     return err('GEMINI_API_KEY is missing.');
   }
 
+  for (const [name, value] of incomingQuery.entries()) {
+    if (geminiPassthroughQueryParams.has(name)) {
+      query.set(name, value);
+    }
+  }
   query.set('key', key);
-  query.delete('target_provider');
 
   const path = `${config.geminiBaseUrl}/${apiVersion}/models/${encodeURIComponent(model)}:${action}`;
   const q = query.toString();
